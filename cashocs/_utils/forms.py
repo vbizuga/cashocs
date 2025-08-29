@@ -268,6 +268,13 @@ def create_dirichlet_bcs(
 
     return bcs_list
 
+def create_periodic_bcs(
+    function_space: fenics.FunctionSpace,
+    boundaries: fenics.MeshFunction,
+    idcs: list[int | str],
+    **kwargs: Any,
+) -> list[fenics.FunctionSpace, fenics.MeshFunction, int, int]:
+    return [function_space, boundaries, idcs[0], idcs[1]]
 
 def bilinear_boundary_form_modification(forms: list[ufl.Form]) -> list[ufl.Form]:
     """Modifies a bilinear form for the case it is given on the boundary only.
