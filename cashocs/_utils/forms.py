@@ -268,13 +268,55 @@ def create_dirichlet_bcs(
 
     return bcs_list
 
+
+class PeriodicBC:
+    """Class representing periodic boundary conditions"""
+    def __init__(self, functionspace, boundaries, master, slave):
+        self.functionspace : fenics.Functionspace = functionspace
+        self.boundaries : fenics.MeshFunction = boundaries
+        self.master_idc : int = master
+        self.slave_idc : int = slave
+
+
 def create_periodic_bcs(
     function_space: fenics.FunctionSpace,
     boundaries: fenics.MeshFunction,
     idcs: list[int | str],
-    **kwargs: Any,
-) -> list[fenics.FunctionSpace, fenics.MeshFunction, int, int]:
-    return [function_space, boundaries, idcs[0], idcs[1]]
+) -> list[PeriodicBC]:
+    """Create periodic boundary conditions.
+
+    Args:
+        function_space: The function space onto which the BCs should be imposed on.
+        boundaries: The :py:class:`fenics.MeshFunction` object representing the
+            boundaries.
+        idcs: A list of indices / boundary markers that determine the boundaries
+            onto which the periodic boundary conditions should be applied to.
+            Is supposed to be a list of two integers, as only two boundaries can
+            be matched periodically.
+
+    Returns:
+        PeriodicBC object that represent the periodic boundary condition.
+
+    Examples:
+        Generate periodic boundary conditions for 2 opposite sides of
+        the unit square ::
+
+            import fenics
+            import cashocs
+
+            mesh, _, boundaries, _, _, _ = cashocs.regular_mesh(25)
+            V = fenics.FunctionSpace(mesh, 'CG', 1)
+            bcs = cashocs.create_periodic_bcs(V, boundaries, [1,3])
+
+    """
+    try:
+        master = idcs[0]
+        slave = idcs[1]
+    except:
+        raise Exception("At least two integers must be passed to create periodic boundary condition")
+    
+    return [PeriodicBC(function_space,boundaries,master,slave)]
+
 
 def bilinear_boundary_form_modification(forms: list[ufl.Form]) -> list[ufl.Form]:
     """Modifies a bilinear form for the case it is given on the boundary only.

@@ -37,7 +37,6 @@ from cashocs import _exceptions
 from cashocs import log
 from cashocs import mpi
 from cashocs._utils import forms as forms_module
-#from cashocs._utils.pbc_interpolator import PeriodicBoundaryInterpolator
 
 if TYPE_CHECKING:
     from cashocs import _typing
@@ -114,7 +113,7 @@ def split_linear_forms(forms: list[ufl.Form]) -> tuple[list[ufl.Form], list[ufl.
 def assemble_petsc_system(
     lhs_form: ufl.Form,
     rhs_form: ufl.Form,
-    bcs: fenics.DirichletBC | list[fenics.DirichletBC|any] | None = None,
+    bcs: fenics.DirichletBC | forms_module.PerdiodicBC | list[fenics.DirichletBC|forms_module.PerdiodicBC] | None = None,
     A_tensor: fenics.PETScMatrix | None = None,  # pylint: disable=invalid-name
     b_tensor: fenics.PETScVector | None = None,
     preconditioner_form: ufl.Form | None = None,
@@ -125,7 +124,7 @@ def assemble_petsc_system(
     Args:
         lhs_form: The UFL form for the left-hand side of the linear equation.
         rhs_form: The UFL form for the right-hand side of the linear equation.
-        bcs: A list of Dirichlet boundary conditions.
+        bcs: A list of Dirichlet boundary conditions or Periodic boundary conditions.
         A_tensor: A matrix into which the result is assembled. Default is ``None``.
         b_tensor: A vector into which the result is assembled. Default is ``None``.
         preconditioner_form: The UFL form for assembling the preconditioner. Must
@@ -157,8 +156,15 @@ def assemble_petsc_system(
     for element in bcs:
         if type(element) == fenics.DirichletBC:
             dbcs += [element]
-        else:
+        elif type(element) == forms_module.PeriodicBC:
             pbcs += [element]
+        else:
+            raise _exceptions.CashocsException(
+                "Boundary conditions must match one of the"
+                "following types:\n"
+                "fenics.DirichletBC\n"
+                "cashocs._utils._forms.PeriodicBC"
+            )
 
     try:
         fenics.assemble_system(
@@ -203,9 +209,11 @@ def assemble_petsc_system(
     A_dolfin = fenics.PETScMatrix(A) 
     b_dolfin = fenics.PETScVector(b)
 
-    if pbcs != []:
-        PBCI = PeriodicBoundaryInterpolator(pbcs[0], pbcs[1], A_dolfin, b_dolfin)
-        A, b = PBCI.create_periodic_matrix(pbcs[2],pbcs[3])
+    for pbc in pbcs:
+        PBCI = PeriodicBoundaryInterpolator(pbc.functionspace, pbc.boundaries, A_dolfin, b_dolfin)
+        A, b = PBCI.assemble_periodic_system(pbc.master_idc,pbc.slave_idc)
+
+    log.end()
 
     return A, b, P
 
@@ -832,6 +840,29 @@ def l2_projection(
 
 
 class PeriodicBoundaryInterpolator:
+    """Interpolation between two boundaries of the function space and assembling
+    the corresponding matrix and vector.
+
+    Args:
+        function_space: The function space onto which the BCs should be imposed on.
+        boundaries: The :py:class:`fenics.MeshFunction` object representing the
+            boundaries.
+        matrix: The fenics.PETScMatrix object on which the periodic BCs should be applied.
+        vector: The fenics.PETScVector object on which the periodic BCs should be applied.
+
+    Returns:
+        A PeriodicBoundaryInterpolator class that is later supposed to be used by
+        calling the subfunction assemble_periodic_system to obtain the assembled 
+        matrix and vector.
+
+    Notes:
+        This class only works properly for linear and quadratic function spaces.
+        The supported types of function spaces are:
+        FiniteElement,
+        VectorElement,
+        MixedElement of FiniteElement or VectorElement.
+
+    """
     def __init__(self, functionspace, boundaries, matrix, vector):
         self.boundaries = boundaries
         self.functionspace : fenics.FunctionSpace = functionspace
@@ -935,7 +966,7 @@ class PeriodicBoundaryInterpolator:
             self.matrix_scipy[dof_s_y,dofs_m_y] = - int_matrix[index_s_y,:]*cosinus
             self.matrix_scipy[dof_s_y,dofs_m_x] = - int_matrix[index_s_y,:]*sinus
 
-    def create_periodic_matrix(self, boundary_ind_master, boundary_ind_slave):
+    def assemble_periodic_system(self, boundary_ind_master, boundary_ind_slave):
         noslipx = fenics.Constant((-5.0, 0.0))
         noslipy = fenics.Constant((0.0, -5.0))
         noslip = fenics.Constant(-5.0)
