@@ -203,15 +203,12 @@ def assemble_petsc_system(
     else:
         P = None  # pylint: disable=invalid-name
 
+    for pbc in pbcs:
+        PBCI = PeriodicBoundaryInterpolator(pbc.functionspace, pbc.boundaries, A_tensor, b_tensor)
+        A, b = PBCI.assemble_periodic_system(pbc.master_idc,pbc.slave_idc)
+
     A = A_tensor.mat()  # pylint: disable=invalid-name
     b = b_tensor.vec()
-
-    A_dolfin = fenics.PETScMatrix(A) 
-    b_dolfin = fenics.PETScVector(b)
-
-    for pbc in pbcs:
-        PBCI = PeriodicBoundaryInterpolator(pbc.functionspace, pbc.boundaries, A_dolfin, b_dolfin)
-        A, b = PBCI.assemble_periodic_system(pbc.master_idc,pbc.slave_idc)
 
     log.end()
 

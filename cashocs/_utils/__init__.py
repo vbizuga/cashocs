@@ -28,12 +28,14 @@ from cashocs._utils import interpolations
 from cashocs._utils import linalg
 from cashocs._utils.forms import bilinear_boundary_form_modification
 from cashocs._utils.forms import create_dirichlet_bcs
+from cashocs._utils.forms import create_periodic_bcs
 from cashocs._utils.forms import create_material_parameter
 from cashocs._utils.forms import max_
 from cashocs._utils.forms import min_
 from cashocs._utils.forms import moreau_yosida_regularization
 from cashocs._utils.forms import multiplication
 from cashocs._utils.forms import summation
+from cashocs._utils.forms import PeriodicBC
 from cashocs._utils.helpers import check_and_enlist_bcs
 from cashocs._utils.helpers import check_and_enlist_control_constraints
 from cashocs._utils.helpers import check_file_extension
@@ -62,11 +64,13 @@ __all__ = [
     "linalg",
     "bilinear_boundary_form_modification",
     "create_dirichlet_bcs",
+    "create_periodic_bcs",
     "max_",
     "min_",
     "moreau_yosida_regularization",
     "multiplication",
     "summation",
+    "PeriodicBC",
     "check_and_enlist_bcs",
     "check_and_enlist_control_constraints",
     "check_file_extension",
