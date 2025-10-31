@@ -90,7 +90,7 @@ class StateFormHandler:
         self.db = db
 
         self.config = self.db.config
-        self.bcs_list: list[list[fenics.DirichletBC]] = self.db.form_db.bcs_list
+        self.bcs_list: list[list[fenics.DirichletBC | _utils.PeriodicBC]] = self.db.form_db.bcs_list
         (
             self.state_eq_forms,
             self.linear_state_eq_forms,
@@ -143,7 +143,7 @@ class StateFormHandler:
 class AdjointFormHandler:
     """Manages weak adjoint forms."""
 
-    bcs_list_ad: list[list[fenics.DirichletBC]]
+    bcs_list_ad: list[list[fenics.DirichletBC | _utils.PeriodicBC]]
     adjoint_eq_lhs: list[ufl.Form]
     adjoint_eq_rhs: list[ufl.Form]
     adjoint_eq_forms: list[ufl.Form]
@@ -167,16 +167,22 @@ class AdjointFormHandler:
             self.adjoint_eq_rhs,
         ) = self._compute_adjoint_equations()
 
-    def _compute_adjoint_boundary_conditions(self) -> list[list[fenics.DirichletBC]]:
+    def _compute_adjoint_boundary_conditions(self) -> list[list[fenics.DirichletBC | _utils.PeriodicBC]]:
         """Computes the boundary conditions for the adjoint systems."""
         if self.db.parameter_db.state_adjoint_equal_spaces:
-            bcs_list_ad = [
-                [fenics.DirichletBC(bc) for bc in self.db.form_db.bcs_list[i]]
+            dbcs_list_ad = [
+                [fenics.DirichletBC(bc) for bc in self.db.form_db.bcs_list[i] if type(bc) != _utils.PeriodicBC]
                 for i in range(self.db.parameter_db.state_dim)
             ]
-            for i in range(self.db.parameter_db.state_dim):
-                for bc in bcs_list_ad[i]:
+            for i in range(len(dbcs_list_ad)):
+                for bc in dbcs_list_ad[i]:
                     bc.homogenize()
+            pbcs_list_ad = [
+                [bc for bc in self.db.form_db.bcs_list[i] if type(bc) == _utils.PeriodicBC]
+                for i in range(self.db.parameter_db.state_dim)
+            ]
+            bcs_list_ad = [[item for sublist in dbcs_list_ad + pbcs_list_ad for item in sublist]]
+
         else:
             bcs_list_ad = [
                 [1] * len(self.db.form_db.bcs_list[i])

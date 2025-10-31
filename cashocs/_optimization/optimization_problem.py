@@ -93,9 +93,9 @@ class OptimizationProblem(abc.ABC):
         self,
         state_forms: list[ufl.Form] | ufl.Form,
         bcs_list: (
-            list[list[fenics.DirichletBC]]
-            | list[fenics.DirichletBC]
-            | fenics.DirichletBC
+            list[list[fenics.DirichletBC | _utils.PeriodicBC]]
+            | list[fenics.DirichletBC | _utils.PeriodicBC]
+            | fenics.DirichletBC | _utils.PeriodicBC
         ),
         cost_functional_form: list[_typing.CostFunctional] | _typing.CostFunctional,
         states: list[fenics.Function] | fenics.Function,
@@ -518,9 +518,9 @@ class OptimizationProblem(abc.ABC):
         self,
         adjoint_forms: ufl.Form | list[ufl.Form],
         adjoint_bcs_list: (
-            fenics.DirichletBC
-            | list[fenics.DirichletBC]
-            | list[list[fenics.DirichletBC]]
+            fenics.DirichletBC | _utils.PeriodicBC
+            | list[fenics.DirichletBC | _utils.PeriodicBC]
+            | list[list[fenics.DirichletBC | _utils.PeriodicBC]]
         ),
     ) -> None:
         """Overwrites the computed weak forms of the adjoint system.

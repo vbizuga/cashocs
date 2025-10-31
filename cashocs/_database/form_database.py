@@ -22,6 +22,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from cashocs._optimization import cost_functional
+from cashocs import _utils
 
 if TYPE_CHECKING:
     import fenics
@@ -41,7 +42,7 @@ class FormDatabase:
         self,
         cost_functional_list: list[_typing.CostFunctional],
         state_forms: list[ufl.Form],
-        bcs_list: list[list[fenics.DirichletBC]],
+        bcs_list: list[list[fenics.DirichletBC | _utils.PeriodicBC]],
         preconditioner_forms: list[ufl.Form],
         newton_linearizations: list[ufl.Form],
     ) -> None:

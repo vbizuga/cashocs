@@ -81,7 +81,7 @@ class StateProblem(pde_problem.PDEProblem):
         else:
             self.excluded_from_time_derivative = [None] * self.db.parameter_db.state_dim
 
-        self.bcs_list: list[list[fenics.DirichletBC]] = self.state_form_handler.bcs_list
+        self.bcs_list: list[list[fenics.DirichletBC | _utils.PeriodicBC]] = self.state_form_handler.bcs_list
         self.states = self.db.function_db.states
         self.states_checkpoint = [fun.copy(True) for fun in self.states]
 

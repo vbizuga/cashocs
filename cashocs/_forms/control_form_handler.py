@@ -96,19 +96,27 @@ class ControlFormHandler(form_handler.FormHandler):
         self.modified_scalar_product = _utils.bilinear_boundary_form_modification(
             scalar_product_forms
         )
+        if bcs[0] is not None:
+            dbcs = [[bc for bc in bcs[i] if type(bc) != _utils.PeriodicBC]
+                    for i in range(len(bcs))]
+            pbcs = [[bc for bc in bcs[i] if type(bc) == _utils.PeriodicBC]
+                    for i in range(len(bcs))]
+        else:
+            dbcs, pbcs = [None], [None]
+
         try:
             self.assemblers.clear()
-            for i in range(len(bcs)):
+            for i in range(len(dbcs)):
                 assembler = fenics.SystemAssembler(
                     self.modified_scalar_product[i],
                     derivatives[i],
-                    bcs[i],
+                    dbcs[i],
                 )
                 assembler.keep_diagonal = True
                 self.assemblers.append(assembler)
         except (AssertionError, ValueError):
             self.assemblers = self._setup_assembler_failsafe(
-                self.modified_scalar_product, derivatives, bcs
+                self.modified_scalar_product, derivatives, dbcs
             )
 
         fenics_scalar_product_matrices = []
@@ -121,6 +129,12 @@ class ControlFormHandler(form_handler.FormHandler):
             fenics_scalar_product_matrices[i].ident_zeros()
 
             self.riesz_projection_matrices.append(fenics_matrix.mat())
+        
+        lhs_form, rhs_form = _utils.split_linear_forms(modified_scalar_product_forms)
+        for pbc in pbcs:
+            for fenics_matrix in self.riesz_projection_matrices:
+                matrix = fenics.PETScMatrix(fenics_matrix)
+                fenics_matrix = fenics.as_backend_type(_utils.assemble_petsc_system(lhs_form[0], rhs_form[0], pbc, matrix))[0]#.mat()
 
         # Test for symmetry of the scalar products
         for matrix in self.riesz_projection_matrices:

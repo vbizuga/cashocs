@@ -151,21 +151,9 @@ def assemble_petsc_system(
         b_tensor = fenics.PETScVector(comm)
 
     # Split boundary conditions
-    dbcs = []
-    pbcs = []
-    for element in bcs:
-        if type(element) == fenics.DirichletBC:
-            dbcs += [element]
-        elif type(element) == forms_module.PeriodicBC:
-            pbcs += [element]
-        else:
-            raise _exceptions.CashocsException(
-                "Boundary conditions must match one of the"
-                "following types:\n"
-                "fenics.DirichletBC\n"
-                "cashocs._utils._forms.PeriodicBC"
-            )
-
+    dbcs = [bc for bc in bcs if type(bc) != forms_module.PeriodicBC]
+    pbcs = [bc for bc in bcs if type(bc) == forms_module.PeriodicBC]
+    
     try:
         fenics.assemble_system(
             mod_lhs_form,
@@ -203,12 +191,15 @@ def assemble_petsc_system(
     else:
         P = None  # pylint: disable=invalid-name
 
-    for pbc in pbcs:
-        PBCI = PeriodicBoundaryInterpolator(pbc.functionspace, pbc.boundaries, A_tensor, b_tensor)
-        A, b = PBCI.assemble_periodic_system(pbc.master_idc,pbc.slave_idc)
-
     A = A_tensor.mat()  # pylint: disable=invalid-name
     b = b_tensor.vec()
+
+    for pbc in pbcs:
+        PBCI_A = PeriodicBoundaryInterpolator(pbc.functionspace, pbc.boundaries, A_tensor)
+        A = PBCI_A.assemble_periodic_system(pbc.master_idc,pbc.slave_idc)
+        PBCI_b = PeriodicBoundaryInterpolator(pbc.functionspace, pbc.boundaries, b_tensor)
+        b = PBCI_b.assemble_periodic_system(pbc.master_idc,pbc.slave_idc)
+
 
     log.end()
 
@@ -441,7 +432,7 @@ def assemble_and_solve_linear(
     lhs_form: ufl.Form,
     rhs_form: ufl.Form,
     function: fenics.Function,
-    bcs: fenics.DirichletBC | list[fenics.DirichletBC] | None = None,
+    bcs: fenics.DirichletBC | forms_module.PeriodicBC | list[fenics.DirichletBC | forms_module.PeriodicBC] | None = None,
     A: fenics.PETScMatrix | None = None,  # pylint: disable=invalid-name
     b: fenics.PETScVector | None = None,
     ksp_options: _typing.KspOption | None = None,
@@ -860,13 +851,16 @@ class PeriodicBoundaryInterpolator:
         MixedElement of FiniteElement or VectorElement.
 
     """
-    def __init__(self, functionspace, boundaries, matrix, vector):
+    def __init__(self, functionspace, boundaries, tensor):
         self.boundaries = boundaries
         self.functionspace : fenics.FunctionSpace = functionspace
         self.mesh = self.functionspace.mesh()
-        self.matrix = fenics.as_backend_type(matrix).mat()
-        self.matrix_scipy = csr_matrix(self.matrix.getValuesCSR()[::-1],shape=self.matrix.size)
-        self.vector = fenics.as_backend_type(vector).vec()
+        self.tensor_type = type(tensor)
+        if self.tensor_type == fenics.PETScMatrix:
+            self.matrix = fenics.as_backend_type(tensor).mat()
+            self.matrix_scipy = csr_matrix(self.matrix.getValuesCSR()[::-1],shape=self.matrix.size)
+        elif self.tensor_type == fenics.PETScVector:
+            self.vector = fenics.as_backend_type(tensor).vec()
         self.dof_coord = self.functionspace.tabulate_dof_coordinates()
         self.rotation : float = 0.0
         self.sorted_indices : list = []
@@ -907,20 +901,24 @@ class PeriodicBoundaryInterpolator:
         return interpolation_matrix
 
     def matrix_manipulation_scalar(self, dofs_m, dofs_s, int_matrix):
-        # Slave Zeilen und Spalten werden auf die entprechende Master Zeile und Spalte addiert
-        self.matrix_scipy[:,dofs_m] += self.matrix_scipy[:,dofs_s] @ int_matrix
-        self.matrix_scipy[dofs_m,:] += int_matrix.T @ self.matrix_scipy[dofs_s,:]
-        self.vector[dofs_m] += int_matrix.T @ self.vector[dofs_s]
+        if self.tensor_type == fenics.PETScMatrix:
+            # Slave Zeilen und Spalten werden auf die entprechende Master Zeile und Spalte addiert
+            self.matrix_scipy[:,dofs_m] += self.matrix_scipy[:,dofs_s] @ int_matrix
+            self.matrix_scipy[dofs_m,:] += int_matrix.T @ self.matrix_scipy[dofs_s,:]
+            # Slave Zeilen und Spalten nullen
+            self.matrix_scipy[dofs_s,:] = 0
+            self.matrix_scipy[:,dofs_s] = 0
 
-        # Slave Zeilen und Spalten nullen
-        self.matrix_scipy[dofs_s,:] = 0
-        self.matrix_scipy[:,dofs_s] = 0
+            # Anpassen der Slave Zeilen und des Lösungsvektors
+            for index_s, dof_s in enumerate(dofs_s):
+                self.matrix_scipy[dof_s,dof_s] = 1
+                self.matrix_scipy[dof_s,dofs_m] = -int_matrix[index_s,:]
 
-        # Anpassen der Slave Zeilen und des Lösungsvektors
-        for index_s, dof_s in enumerate(dofs_s):
-            self.vector[dof_s] = 0
-            self.matrix_scipy[dof_s,dof_s] = 1
-            self.matrix_scipy[dof_s,dofs_m] = -int_matrix[index_s,:]
+        elif self.tensor_type == fenics.PETScVector:
+            self.vector[dofs_m] += int_matrix.T @ self.vector[dofs_s]
+
+            for index_s, dof_s in enumerate(dofs_s):
+                        self.vector[dof_s] = 0
 
     def matrix_manipulation_vector(self, dofs_m_x, dofs_s_x, dofs_m_y, dofs_s_y, int_matrix):
         # Berechne Winkel. Annahme: Strecken ohne Knick, Dreiecksberechnung
@@ -937,31 +935,36 @@ class PeriodicBoundaryInterpolator:
         sinus = np.round(np.sin(self.rotation), 6)
         cosinus = np.round(np.cos(self.rotation), 6)
 
-        # Slave Zeilen und Spalten werden auf die entprechende Master Zeile und Spalte addiert
-        self.matrix_scipy[:,dofs_m_x] += self.matrix_scipy[:,dofs_s_x] @ int_matrix * cosinus + self.matrix_scipy[:,dofs_s_y] @ int_matrix * sinus
-        self.matrix_scipy[dofs_m_x,:] += int_matrix.T @ self.matrix_scipy[dofs_s_x,:] * cosinus + int_matrix.T @ self.matrix_scipy[dofs_s_y,:]  * sinus
-        self.matrix_scipy[:,dofs_m_y] += self.matrix_scipy[:,dofs_s_y] @ int_matrix * cosinus - self.matrix_scipy[:,dofs_s_x] @ int_matrix * sinus
-        self.matrix_scipy[dofs_m_y,:] += int_matrix.T @ self.matrix_scipy[dofs_s_y,:]  * cosinus - int_matrix.T @ self.matrix_scipy[dofs_s_x,:] * sinus
-        self.vector[dofs_m_x] += int_matrix.T @ self.vector[dofs_s_x] * cosinus + int_matrix.T @ self.vector[dofs_s_y]  * sinus
-        self.vector[dofs_m_y] += int_matrix.T @ self.vector[dofs_s_y]  * cosinus - int_matrix.T @ self.vector[dofs_s_x] * sinus
+        if self.tensor_type == fenics.PETScMatrix:
+            # Slave Zeilen und Spalten werden auf die entprechende Master Zeile und Spalte addiert
+            self.matrix_scipy[:,dofs_m_x] += self.matrix_scipy[:,dofs_s_x] @ int_matrix * cosinus + self.matrix_scipy[:,dofs_s_y] @ int_matrix * sinus
+            self.matrix_scipy[dofs_m_x,:] += int_matrix.T @ self.matrix_scipy[dofs_s_x,:] * cosinus + int_matrix.T @ self.matrix_scipy[dofs_s_y,:]  * sinus
+            self.matrix_scipy[:,dofs_m_y] += self.matrix_scipy[:,dofs_s_y] @ int_matrix * cosinus - self.matrix_scipy[:,dofs_s_x] @ int_matrix * sinus
+            self.matrix_scipy[dofs_m_y,:] += int_matrix.T @ self.matrix_scipy[dofs_s_y,:]  * cosinus - int_matrix.T @ self.matrix_scipy[dofs_s_x,:] * sinus
 
-        # Slave Zeilen und Spalten nullen
-        self.matrix_scipy[dofs_s_x,:] = 0
-        self.matrix_scipy[:,dofs_s_x] = 0
-        self.matrix_scipy[dofs_s_y,:] = 0
-        self.matrix_scipy[:,dofs_s_y] = 0
-        
-        for index_s_x, dof_s_x in enumerate(dofs_s_x):
-            self.vector[dof_s_x] = 0
-            self.matrix_scipy[dof_s_x,dof_s_x] = 1
-            self.matrix_scipy[dof_s_x,dofs_m_x] = - int_matrix[index_s_x,:]*cosinus
-            self.matrix_scipy[dof_s_x,dofs_m_y] = + int_matrix[index_s_x,:]*sinus
+            # Slave Zeilen und Spalten nullen
+            self.matrix_scipy[dofs_s_x,:] = 0
+            self.matrix_scipy[:,dofs_s_x] = 0
+            self.matrix_scipy[dofs_s_y,:] = 0
+            self.matrix_scipy[:,dofs_s_y] = 0
+            
+            for index_s_x, dof_s_x in enumerate(dofs_s_x):
+                self.matrix_scipy[dof_s_x,dof_s_x] = 1
+                self.matrix_scipy[dof_s_x,dofs_m_x] = - int_matrix[index_s_x,:]*cosinus
+                self.matrix_scipy[dof_s_x,dofs_m_y] = + int_matrix[index_s_x,:]*sinus
 
-        for index_s_y, dof_s_y in enumerate(dofs_s_y):
-            self.vector[dof_s_y] = 0
-            self.matrix_scipy[dof_s_y,dof_s_y] = 1
-            self.matrix_scipy[dof_s_y,dofs_m_y] = - int_matrix[index_s_y,:]*cosinus
-            self.matrix_scipy[dof_s_y,dofs_m_x] = - int_matrix[index_s_y,:]*sinus
+            for index_s_y, dof_s_y in enumerate(dofs_s_y):
+                self.matrix_scipy[dof_s_y,dof_s_y] = 1
+                self.matrix_scipy[dof_s_y,dofs_m_y] = - int_matrix[index_s_y,:]*cosinus
+                self.matrix_scipy[dof_s_y,dofs_m_x] = - int_matrix[index_s_y,:]*sinus
+
+        elif self.tensor_type == fenics.PETScVector:
+            self.vector[dofs_m_x] += int_matrix.T @ self.vector[dofs_s_x] * cosinus + int_matrix.T @ self.vector[dofs_s_y]  * sinus
+            self.vector[dofs_m_y] += int_matrix.T @ self.vector[dofs_s_y]  * cosinus - int_matrix.T @ self.vector[dofs_s_x] * sinus
+            for index_s_x, dof_s_x in enumerate(dofs_s_x):
+                self.vector[dof_s_x] = 0
+            for index_s_y, dof_s_y in enumerate(dofs_s_y):
+                self.vector[dof_s_y] = 0
 
     def assemble_periodic_system(self, boundary_ind_master, boundary_ind_slave):
         noslipx = fenics.Constant((-5.0, 0.0))
@@ -1146,7 +1149,12 @@ class PeriodicBoundaryInterpolator:
                     counter += 2
 
         # Matrix zurückgeben
-        self.matrix = scipy2petsc(self.matrix_scipy, self.mesh.mpi_comm())
-        A = fenics.PETScMatrix(self.matrix)
-        b = fenics.PETScVector(self.vector)
-        return A, b
+        if self.tensor_type == fenics.PETScMatrix:
+            self.matrix = scipy2petsc(self.matrix_scipy, self.mesh.mpi_comm())
+            A_wrap = fenics.PETScMatrix(self.matrix)
+            A = fenics.as_backend_type(A_wrap).mat()
+            return A
+        elif self.tensor_type == fenics.PETScVector:
+            b_wrap = fenics.PETScVector(self.vector)
+            b = fenics.as_backend_type(b_wrap).vec()
+            return b

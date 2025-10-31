@@ -27,6 +27,7 @@ from cashocs._database import form_database
 from cashocs._database import function_database
 from cashocs._database import geometry_database
 from cashocs._database import parameter_database
+from cashocs import _utils
 from cashocs._optimization.optimization_algorithms import callback as cb
 
 if TYPE_CHECKING:
@@ -52,7 +53,7 @@ class Database:
         gradient_ksp_options: list[_typing.KspOption] | None,
         cost_functional_list: list[_typing.CostFunctional],
         state_forms: list[ufl.Form],
-        bcs_list: list[list[fenics.DirichletBC]],
+        bcs_list: list[list[fenics.DirichletBC | _utils.PeriodicBC]],
         preconditioner_forms: list[ufl.Form],
         newton_linearizations: list[ufl.Form],
         excluded_from_time_derivative: (list[int] | list[list[int]] | list[None]),

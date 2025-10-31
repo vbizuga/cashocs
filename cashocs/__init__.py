@@ -52,6 +52,7 @@ from cashocs._optimization.shape_optimization.shape_optimization_problem import 
 from cashocs._optimization.topology_optimization import TopologyOptimizationProblem
 from cashocs._utils import create_dirichlet_bcs
 from cashocs._utils import create_periodic_bcs
+from cashocs._utils import assemble_petsc_system
 from cashocs._utils import create_material_parameter
 from cashocs._utils import interpolate_levelset_function_to_cells
 from cashocs._utils import Interpolator
@@ -161,6 +162,7 @@ __all__ = [
     "TopologyOptimizationProblem",
     "create_dirichlet_bcs",
     "create_periodic_bcs",
+    "assemble_petsc_system",
     "create_material_parameter",
     "interpolate_levelset_function_to_cells",
     "Interpolator",

@@ -27,6 +27,7 @@ from typing import Any, cast, TYPE_CHECKING, TypeVar
 import fenics
 
 from cashocs import _exceptions
+from cashocs._utils import forms as forms_module
 from cashocs import log
 
 if TYPE_CHECKING:
@@ -53,9 +54,9 @@ def enlist(arg: list[T] | T) -> list[T]:
 
 def check_and_enlist_bcs(
     bcs_list: (
-        fenics.DirichletBC | list[fenics.DirichletBC] | list[list[fenics.DirichletBC]]
+        fenics.DirichletBC | forms_module.PeriodicBC | list[fenics.DirichletBC | forms_module.PeriodicBC] | list[list[fenics.DirichletBC | forms_module.PeriodicBC]]
     ),
-) -> list[list[fenics.DirichletBC]]:
+) -> list[list[fenics.DirichletBC | forms_module.PeriodicBC]]:
     """Enlists DirichletBC objects for cashocs.
 
     Args:
@@ -65,11 +66,11 @@ def check_and_enlist_bcs(
         The wrapped list of DirichletBC objects
 
     """
-    if isinstance(bcs_list, fenics.DirichletBC):
+    if isinstance(bcs_list, (fenics.DirichletBC, forms_module.PeriodicBC)):
         return [[bcs_list]]
     elif isinstance(bcs_list, list) and len(bcs_list) == 0:
         return [bcs_list]
-    elif isinstance(bcs_list, list) and isinstance(bcs_list[0], fenics.DirichletBC):
+    elif isinstance(bcs_list, list) and isinstance(bcs_list[0], (fenics.DirichletBC, forms_module.PeriodicBC)):
         return [bcs_list]
     elif isinstance(bcs_list, list) and isinstance(bcs_list[0], list):
         return bcs_list

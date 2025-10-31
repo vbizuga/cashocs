@@ -65,9 +65,9 @@ class OptimalControlProblem(optimization_problem.OptimizationProblem):
         self,
         state_forms: list[ufl.Form] | ufl.Form,
         bcs_list: (
-            list[list[fenics.DirichletBC]]
-            | list[fenics.DirichletBC]
-            | fenics.DirichletBC
+            list[list[fenics.DirichletBC | _utils.PeriodicBC]]
+            | list[fenics.DirichletBC | _utils.PeriodicBC]
+            | fenics.DirichletBC | _utils.PeriodicBC
         ),
         cost_functional_form: list[_typing.CostFunctional] | _typing.CostFunctional,
         states: list[fenics.Function] | fenics.Function,
@@ -82,9 +82,9 @@ class OptimalControlProblem(optimization_problem.OptimizationProblem):
         gradient_ksp_options: _typing.KspOption | list[_typing.KspOption] | None = None,
         desired_weights: list[float] | None = None,
         control_bcs_list: (
-            list[list[fenics.DirichletBC]]
-            | list[fenics.DirichletBC]
-            | fenics.DirichletBC
+            list[list[fenics.DirichletBC | _utils.PeriodicBC]]
+            | list[fenics.DirichletBC | _utils.PeriodicBC]
+            | fenics.DirichletBC | _utils.PeriodicBC
             | None
         ) = None,
         preconditioner_forms: list[ufl.Form] | ufl.Form | None = None,
@@ -211,18 +211,22 @@ class OptimalControlProblem(optimization_problem.OptimizationProblem):
         )
 
         self.use_control_bcs = False
-        self.control_bcs_list: list[list[fenics.DirichletBC]] | list[None]
+        self.control_bcs_list: list[list[fenics.DirichletBC | _utils.PeriodicBC]] | list[None]
         if control_bcs_list is not None:
             self.control_bcs_list_inhomogeneous = _utils.check_and_enlist_bcs(
                 control_bcs_list
             )
             self.control_bcs_list = []
             for list_bcs in self.control_bcs_list_inhomogeneous:
-                hom_bcs: list[fenics.DirichletBC] = [
-                    fenics.DirichletBC(bc) for bc in list_bcs
+                hom_dbcs: list[fenics.DirichletBC] = [
+                    fenics.DirichletBC(bc) for bc in list_bcs if type(bc) != _utils.PeriodicBC
                 ]
-                for bc in hom_bcs:
+                for bc in hom_dbcs:
                     bc.homogenize()
+                pbcs_list: list[_utils.PeriodicBC] = [
+                   bc for bc in list_bcs if type(bc) == _utils.PeriodicBC
+                ]
+                hom_bcs = hom_dbcs + pbcs_list
                 self.control_bcs_list.append(hom_bcs)  # type: ignore
 
             self.use_control_bcs = True
@@ -308,7 +312,14 @@ class OptimalControlProblem(optimization_problem.OptimizationProblem):
         if self.use_control_bcs:
             for i in range(len(self.db.function_db.controls)):
                 for bc in self.control_bcs_list_inhomogeneous[i]:
-                    bc.apply(self.db.function_db.controls[i].vector())
+                    if type(bc) == fenics.DirichletBC:
+                        bc.apply(self.db.function_db.controls[i].vector())
+                        print(type(self.db.function_db.controls[i]))
+                    elif type(bc) == _utils.PeriodicBC:
+                        lhs_list, rhs_list = _utils.split_linear_forms(self.form_handler.modified_scalar_product)
+                        _, petsc_vec , _ = _utils.assemble_petsc_system(lhs_list[0], rhs_list[0], [bc], b_tensor = self.db.function_db.controls[i].vector())
+                        self.db.function_db.controls[i].vector().vec = petsc_vec.copy()
+                        self.db.function_db.controls[i].vector().apply('insert')
 
     def _setup_solver(self) -> optimization_algorithms.OptimizationAlgorithm:
         line_search_type = self.config.get("LineSearch", "method").casefold()
@@ -467,9 +478,9 @@ class OptimalControlProblem(optimization_problem.OptimizationProblem):
         derivatives: ufl.Form | list[ufl.Form],
         adjoint_forms: ufl.Form | list[ufl.Form],
         adjoint_bcs_list: (
-            fenics.DirichletBC
-            | list[fenics.DirichletBC]
-            | list[list[fenics.DirichletBC]]
+            fenics.DirichletBC | _utils.PeriodicBC
+            | list[fenics.DirichletBC | _utils.PeriodicBC]
+            | list[list[fenics.DirichletBC | _utils.PeriodicBC]]
         ),
     ) -> None:
         """Overrides both adjoint system and derivatives with user input.
