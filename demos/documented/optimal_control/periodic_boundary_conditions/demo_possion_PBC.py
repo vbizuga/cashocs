@@ -63,10 +63,10 @@ config = cashocs.load_config("config.ini")
 
 # -
 # In the next step, we build a quadratic mesh as in the Demo for the Poisson Problem.
-# The function space and problem formulation also follows the Poisson Demo.
-# +
 
 mesh, subdomains, boundaries, dx, ds, dS = cashocs.regular_mesh(25)
+
+# To keep it simnple, the function space and problem formulation are also adopted.
 
 V = FunctionSpace(mesh, "CG", 1)
 
@@ -76,24 +76,25 @@ u = Function(V)
 e = inner(grad(y), grad(p)) * dx - u * p * dx
 
 #-
-# Coming to the implementation of the boundary conditions, one needs an additional function
-# {py:func}`create_periodic_bcs <cashocs.create_periodic_bcs>` implementing the periodic boundary
-# conditions.
-# +
+# The (homogeneous) Dirichlet boundary conditions can be specified via 
 
-bcs = cashocs.create_dirichlet_bcs(V, Constant(0), boundaries, [3, 4])
-pbc = cashocs.create_periodic_bcs(V, boundaries, [1,2])
+dbc = cashocs.create_dirichlet_bcs(V, Constant(0), boundaries, [3, 4])
 
-# -
+# To implement periodic bopundary conditions, in this example mapping the left side (index 1) to the right
+# side (index 2), one needs an additional function {py:func}`create_periodic_bcs <cashocs.create_periodic_bcs>`
+# implementing the periodic boundary conditions.
+
+pbc = cashocs.create_periodic_bcs(V, boundaries, [1, 2])
+
 # This function takes the function space, the boundaries, and a list of two indices of the
 # boundaries to be matched. The first index represents the master side and the second the slave side.
 # Note that these two boundaries should have the same length. No spatial relation needs to be specified, 
 # as rotation and translation of the DOFs to be mapped are handled internally. The function creates a 
 # list of PeriodicBC objects, that can be added to the existing list of DirichletBCs:
 
-bc = bcs + pbc
+bc =  dbc + pbc
 
-# Now this list can be passed to the solver, as seen further down.
+# The list bc, containing various DirichletBCs or PeriodicBCs, can be passed to the solver.
 #
 # ### Definition of the cost functional
 #
@@ -118,10 +119,7 @@ J = cashocs.IntegralFunctional(
 #+
 
 ocp = cashocs.OptimalControlProblem(e, bc, J, y, u, p, config=config, control_bcs_list=pbc)
-try:
-    ocp.solve()
-except:
-    pass
+ocp.solve(max_iter=1000)
 
 #-
 #
