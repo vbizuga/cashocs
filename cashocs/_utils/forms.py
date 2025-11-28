@@ -271,17 +271,26 @@ def create_dirichlet_bcs(
 
 class PeriodicBC:
     """Class representing periodic boundary conditions"""
-    def __init__(self, functionspace, boundaries, master, slave):
+    def __init__(
+        self,
+        functionspace: fenics.FunctionSpace,
+        boundaries: fenics.MeshFunction,
+        main: int | str,
+        secondary: int | str,
+        constrained_domain: fenics.SubDomain,
+    ) -> None:
         self.functionspace : fenics.Functionspace = functionspace
         self.boundaries : fenics.MeshFunction = boundaries
-        self.master_idc : int = master
-        self.slave_idc : int = slave
+        self.main_idc : int = main
+        self.secondary_idc : int = secondary
+        self.constrained_domain : fenics.SubDomain = constrained_domain
 
 
 def create_periodic_bcs(
     function_space: fenics.FunctionSpace,
     boundaries: fenics.MeshFunction,
     idcs: list[int | str],
+    constrained_domain: fenics.SubDomain,
 ) -> list[PeriodicBC]:
     """Create periodic boundary conditions.
 
@@ -293,6 +302,8 @@ def create_periodic_bcs(
             onto which the periodic boundary conditions should be applied to.
             Is supposed to be a list of two integers, as only two boundaries can
             be matched periodically.
+        constrained_domain: a SubDomain class determining the translation and 
+            rotation from the main to the secondary side
 
     Returns:
         PeriodicBC object that represent the periodic boundary condition.
@@ -310,12 +321,12 @@ def create_periodic_bcs(
 
     """
     try:
-        master = idcs[0]
-        slave = idcs[1]
+        main = idcs[0]
+        secondary = idcs[1]
     except:
         raise Exception("At least two integers must be passed to create periodic boundary condition")
     
-    return [PeriodicBC(function_space,boundaries,master,slave)]
+    return [PeriodicBC(function_space, boundaries, main, secondary, constrained_domain)]
 
 
 def bilinear_boundary_form_modification(forms: list[ufl.Form]) -> list[ufl.Form]:

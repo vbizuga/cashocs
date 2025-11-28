@@ -83,7 +83,7 @@ class ControlFormHandler(form_handler.FormHandler):
         self,
         scalar_product_forms: list[ufl.Form],
         derivatives: list[ufl.Form],
-        bcs: list[list[fenics.DirichletBC]] | list[None],
+        bcs: list[list[fenics.DirichletBC | _utils.PeriodicBC]] | list[None],
     ) -> None:
         """Sets up the assemblers and matrices for the projection of the gradient.
 
@@ -134,7 +134,7 @@ class ControlFormHandler(form_handler.FormHandler):
         for pbc in pbcs:
             for fenics_matrix in self.riesz_projection_matrices:
                 matrix = fenics.PETScMatrix(fenics_matrix)
-                fenics_matrix = fenics.as_backend_type(_utils.assemble_petsc_system(lhs_form[0], rhs_form[0], pbc, matrix))[0]#.mat()
+                fenics_matrix = fenics.as_backend_type(_utils.assemble_petsc_system(lhs_form[0], rhs_form[0], pbc, matrix))[0]
 
         # Test for symmetry of the scalar products
         for matrix in self.riesz_projection_matrices:

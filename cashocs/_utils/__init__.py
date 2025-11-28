@@ -52,6 +52,7 @@ from cashocs._utils.linalg import assemble_and_solve_linear
 from cashocs._utils.linalg import assemble_petsc_system
 from cashocs._utils.linalg import compute_equation_residuals
 from cashocs._utils.linalg import Interpolator
+from cashocs._utils.linalg import PeriodicBoundaryInterpolator
 from cashocs._utils.linalg import l2_projection
 from cashocs._utils.linalg import setup_petsc_options
 from cashocs._utils.linalg import solve_linear_problem

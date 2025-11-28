@@ -151,8 +151,18 @@ def assemble_petsc_system(
         b_tensor = fenics.PETScVector(comm)
 
     # Split boundary conditions
-    dbcs = [bc for bc in bcs if type(bc) != forms_module.PeriodicBC]
-    pbcs = [bc for bc in bcs if type(bc) == forms_module.PeriodicBC]
+    if type(bcs) == list:
+        dbcs = [bc for bc in bcs if type(bc) != forms_module.PeriodicBC]
+        pbcs = [bc for bc in bcs if type(bc) == forms_module.PeriodicBC]
+    elif type(bcs) == fenics.DirichletBC:
+        dbcs = [bcs]
+        pbcs = []
+    elif type(bcs) == forms_module.PeriodicBC:
+        dbcs = []
+        pbcs = [bcs]
+    else:
+        dbcs = bcs
+        pbcs = []
     
     try:
         fenics.assemble_system(
@@ -195,10 +205,9 @@ def assemble_petsc_system(
     b = b_tensor.vec()
 
     for pbc in pbcs:
-        PBCI_A = PeriodicBoundaryInterpolator(pbc.functionspace, pbc.boundaries, A_tensor)
-        A = PBCI_A.assemble_periodic_system(pbc.master_idc,pbc.slave_idc)
-        PBCI_b = PeriodicBoundaryInterpolator(pbc.functionspace, pbc.boundaries, b_tensor)
-        b = PBCI_b.assemble_periodic_system(pbc.master_idc,pbc.slave_idc)
+        PBI = PeriodicBoundaryInterpolator(pbc)
+        A = PBI.apply_periodic_bcs(A_tensor)
+        b = PBI.apply_periodic_bcs(b_tensor)
 
 
     log.end()
@@ -827,20 +836,55 @@ def l2_projection(
     return res
 
 
+def create_interpolation_matrix(
+        src: list[float], 
+        dst: list[float], 
+        degree: int | str
+        ) -> np.NDArray[float]:
+    """Constructs a interpolation matrix between two given 1-D sets of coordinates.
+
+    Args:
+        src: 1-D list of source coordinates in monotone order in a straight line
+        dst: 1-D list of destination coordinates in monotone order in a straight line
+        degree: linear or quadratic interpolation
+
+    Returns:
+        The resulting Numpy Interpolation Matrix
+
+    """
+    n_src = len(src)
+    n_dst = len(dst)
+    interpolation_matrix = np.zeros((n_dst, n_src))
+    basis = np.identity(n_src)
+
+    if degree == 'linear' or degree == 1:
+        for i in range(n_src):
+            interpolation_matrix[:, i] = np.interp(dst, src, basis[i])
+
+    elif degree == 'quadratic' or degree == 2:
+        for i in range(n_src):
+            interpolation_matrix[:, i] = make_interp_spline(src, basis[i], k=2)(dst)
+
+    elif degree == 'cubic' or degree == 3:
+        for i in range(n_src):
+            interpolation_matrix[:, i] = CubicSpline(src, basis[i], bc_type='natural')(dst)
+
+    else:
+        raise RuntimeError("No Interpolation possible")
+
+    return interpolation_matrix
+
+
 class PeriodicBoundaryInterpolator:
     """Interpolation between two boundaries of the function space and assembling
     the corresponding matrix and vector.
 
     Args:
-        function_space: The function space onto which the BCs should be imposed on.
-        boundaries: The :py:class:`fenics.MeshFunction` object representing the
-            boundaries.
-        matrix: The fenics.PETScMatrix object on which the periodic BCs should be applied.
-        vector: The fenics.PETScVector object on which the periodic BCs should be applied.
+        pbc: The cashocs PeriodicBC object for the Periodic Boundary Conditions
 
     Returns:
         A PeriodicBoundaryInterpolator class that is later supposed to be used by
-        calling the subfunction assemble_periodic_system to obtain the assembled 
+        calling the subfunction apply_periodic_bcs to obtain the assembled 
         matrix and vector.
 
     Notes:
@@ -851,79 +895,237 @@ class PeriodicBoundaryInterpolator:
         MixedElement of FiniteElement or VectorElement.
 
     """
-    def __init__(self, functionspace, boundaries, tensor):
-        self.boundaries = boundaries
-        self.functionspace : fenics.FunctionSpace = functionspace
+    def __init__(
+            self, pbc: forms_module.PeriodicBC
+        ) -> None:
+        """Initializes self.
+
+        Args:
+            pbc: the periodic boundary conditions to be implemented
+
+        """
+        self.boundaries = pbc.boundaries
+        self.functionspace: fenics.FunctionSpace = pbc.functionspace
+        self.constrained_domain: fenics.SubDomain = pbc.constrained_domain
+        self.boundary_ind_main: int = pbc.main_idc
+        self.boundary_ind_secondary: int = pbc.secondary_idc
+
         self.mesh = self.functionspace.mesh()
-        self.tensor_type = type(tensor)
-        if self.tensor_type == fenics.PETScMatrix:
-            self.matrix = fenics.as_backend_type(tensor).mat()
-            self.matrix_scipy = csr_matrix(self.matrix.getValuesCSR()[::-1],shape=self.matrix.size)
-        elif self.tensor_type == fenics.PETScVector:
-            self.vector = fenics.as_backend_type(tensor).vec()
         self.dof_coord = self.functionspace.tabulate_dof_coordinates()
-        self.rotation : float = 0.0
-        self.sorted_indices : list = []
+        self.sorted_indices: list = self._locate_dofs()
 
-    def get_interp_type(self, functionspace):
-        if functionspace.ufl_element().degree() == 1:
-            interp_type = 'linear'
-        elif functionspace.ufl_element().degree() == 2:
-            interp_type = 'quadratic'
-        elif functionspace.ufl_element().degree() == 3:
-            interp_type = 'cubic'
-        else:
-            interp_type = 'quadratic'
+        self.rotation: float = None
+
+
+    def _locate_dofs(
+            self
+        ) -> list[list[int]]:
+        '''Provides the indices of the dofs on the main and the secondary side.
+
+        Returns: 
+            sorted_indices: a sorted and structured list of the indices of the main and secondary side
+
+        '''
+        sorted_indices = []
+        noslipx = fenics.Constant((-5.0, 0.0))
+        noslipy = fenics.Constant((0.0, -5.0))
+        noslip = fenics.Constant(-5.0)
+        aux_bcs = []
         
-        return interp_type
+        if self.functionspace.num_sub_spaces() == 0:
+            aux_bcs += forms_module.create_dirichlet_bcs(self.functionspace, noslip, self.boundaries, self.boundary_ind_main)
+            aux_bcs += forms_module.create_dirichlet_bcs(self.functionspace, noslip, self.boundaries, self.boundary_ind_secondary)
 
-    def create_interpolation_matrix(self, src, dst, interp_type):
-        n_src = len(src)
-        n_dst = len(dst)
-        interpolation_matrix = np.zeros((n_dst, n_src))
-        basis = np.identity(n_src)
+        elif isinstance(self.functionspace.ufl_element(), fenics.VectorElement):
+            aux_bcs += forms_module.create_dirichlet_bcs(self.functionspace, noslipx, self.boundaries, self.boundary_ind_main)
+            aux_bcs += forms_module.create_dirichlet_bcs(self.functionspace, noslipx, self.boundaries, self.boundary_ind_secondary)
+            aux_bcs += forms_module.create_dirichlet_bcs(self.functionspace, noslipy, self.boundaries, self.boundary_ind_main)
+            aux_bcs += forms_module.create_dirichlet_bcs(self.functionspace, noslipy, self.boundaries, self.boundary_ind_secondary)
 
-        if interp_type == 'linear':
-            for i in range(n_src):
-                interpolation_matrix[:, i] = np.interp(dst, src, basis[i])
-
-        elif interp_type == 'quadratic':
-            for i in range(n_src):
-                interpolation_matrix[:, i] = make_interp_spline(src, basis[i], k=2)(dst)
-
-        elif interp_type == 'cubic':
-            for i in range(n_src):
-                interpolation_matrix[:, i] = CubicSpline(src, basis[i], bc_type='natural')(dst)
-
+        elif isinstance(self.functionspace.ufl_element(), fenics.MixedElement):
+            for subspace_index in range(self.functionspace.num_sub_spaces()):
+                if self.functionspace.sub(subspace_index).num_sub_spaces() == 0:
+                    aux_bcs += forms_module.create_dirichlet_bcs(self.functionspace.sub(subspace_index), noslip, self.boundaries, self.boundary_ind_main)
+                    aux_bcs += forms_module.create_dirichlet_bcs(self.functionspace.sub(subspace_index), noslip, self.boundaries, self.boundary_ind_secondary)
+                elif isinstance(self.functionspace.sub(subspace_index).ufl_element(), fenics.VectorElement):
+                    aux_bcs += forms_module.create_dirichlet_bcs(self.functionspace.sub(subspace_index), noslipx, self.boundaries, self.boundary_ind_main)
+                    aux_bcs += forms_module.create_dirichlet_bcs(self.functionspace.sub(subspace_index), noslipx, self.boundaries, self.boundary_ind_secondary)
+                    aux_bcs += forms_module.create_dirichlet_bcs(self.functionspace.sub(subspace_index), noslipy, self.boundaries, self.boundary_ind_main)
+                    aux_bcs += forms_module.create_dirichlet_bcs(self.functionspace.sub(subspace_index), noslipy, self.boundaries, self.boundary_ind_secondary)
+                else:
+                    print(self.functionspace.sub(subspace_index).num_sub_spaces())
+                    raise RuntimeError("subspace dimension not fitting")
+                
         else:
-            raise RuntimeError("false interpolation type")
+            raise RuntimeError("function spaces not fitting")
 
-        return interpolation_matrix
+        for i, bc in enumerate(aux_bcs):
+            t = fenics.Function(self.functionspace)
+            tv = t.vector()
+            bc.apply(tv)
+            structured_indices = np.where(abs(np.array(tv)+5.0) < fenics.DOLFIN_EPS_LARGE)[0]
+            if i%2 == 0:
+                sorted_indices += [
+                    structured_indices[np.argsort(self.dof_coord[:,1][structured_indices]
+                                                +self.dof_coord[:,0][structured_indices])].astype('int32')]
+            elif i%2 == 1:
+                reference_dof = [0,0]
+                reference_dof = self.constrained_domain.map(self.dof_coord[sorted_indices[i-1]][0,:], reference_dof)
+                sorted_indices += [
+                    structured_indices[np.argsort(abs(reference_dof[1]
+                                                -self.dof_coord[:,1][structured_indices])**2
+                                                +abs(reference_dof[0]
+                                                -self.dof_coord[:,0][structured_indices]))].astype('int32')]
+                
+        return sorted_indices
 
-    def matrix_manipulation_scalar(self, dofs_m, dofs_s, int_matrix):
+
+    def _split_dof_coordinates(
+            self, dimension: int, counter: int
+            ) -> tuple[list[list[int]], list[list[int]]]:
+        '''Splits the dof coordinates based on their position on a node or between two nodes. Is needed for quadratic function spaces.
+        
+        Args:
+            dimension: the degree of the functionspace
+            counter: number of the current subspace
+
+        Returns:
+            dofs_node_btwn: an ordered list of the indices of the dofs
+            dofs_node_btwn_coordinates: an ordered list of the coordinates of the dofs
+
+        '''
+        if dimension == 1:
+            dofs_node_btwn = []
+            dofs_node_btwn_coordinates = [[0],[0]]
+
+            for i in range(2):
+                for index, dof in enumerate(self.sorted_indices[2*counter+i]):
+                    if index < len(self.sorted_indices[2*counter+i])-1:
+                        dofs_node_btwn_coordinates[i] += [((self.dof_coord[dof][1] - self.dof_coord[self.sorted_indices[2*counter+i][index+1]][1])**2
+                                                        +(self.dof_coord[dof][0] - self.dof_coord[self.sorted_indices[2*counter+i][index+1]][0])**2)**(1/2) 
+                                                        + dofs_node_btwn_coordinates[i][index]]
+            
+        elif dimension == 2:
+            dofs_node_btwn = [[],[],[],[]]
+            dofs_node_btwn_coordinates = [[0],[0],[0],[0]]
+
+            for i in range(2):
+                for index, dof in enumerate(self.sorted_indices[2*counter+i]):
+                    if index%2 == 0:
+                        dofs_node_btwn[i*2] += [dof]
+                    else:
+                        dofs_node_btwn[i*2+1] += [dof]
+            
+            for i in range(4):
+                for index, dof in enumerate(dofs_node_btwn[i]):
+                    if index < len(dofs_node_btwn[i])-1:
+                        dofs_node_btwn_coordinates[i] += [((self.dof_coord[dof][1] - self.dof_coord[dofs_node_btwn[i][index+1]][1])**2
+                                                        +(self.dof_coord[dof][0] - self.dof_coord[dofs_node_btwn[i][index+1]][0])**2)**(1/2) 
+                                                        + dofs_node_btwn_coordinates[i][index]]
+                        
+        elif dimension == 3:
+            dofs_node_btwn = [[],[],[],[],[],[],[],[]]
+            dofs_node_btwn_coordinates = [[0],[0],[0],[0]]
+
+            for i in range(4):
+                for index, dof in enumerate(self.sorted_indices[2*counter+i]):
+                    if index%2 == 0:
+                        dofs_node_btwn[i*2] += [dof]
+                    else:
+                        dofs_node_btwn[i*2+1] += [dof]
+
+            for i in range(4):
+                for index, dof in enumerate(dofs_node_btwn[i]):
+                    if index < len(dofs_node_btwn[i])-1:
+                        dofs_node_btwn_coordinates[i] += [((self.dof_coord[dof][1] - self.dof_coord[dofs_node_btwn[i][index+1]][1])**2
+                                                        +(self.dof_coord[dof][0] - self.dof_coord[dofs_node_btwn[i][index+1]][0])**2)**(1/2) 
+                                                        + dofs_node_btwn_coordinates[i][index]]
+                        
+        return dofs_node_btwn, dofs_node_btwn_coordinates
+
+
+    def _copy_rows(
+            self, 
+            main_0: list[int], 
+            main_1: list[int], 
+            secondary_0: list[int], 
+            secondary_1: list[int], 
+            sinus: float, 
+            cosinus: float, 
+            int_matrix: np.NDArray[float]
+        ) -> None:
+        ''' Copies the rows of the secondary side to the corresponding rows on the main side respecting rotation and interpolation
+        
+        Args:
+            main_0, main_1: the dofs on the main side, respectively the x- and y-value
+            secondary_0, secondray_1: the dofs on the secondary side, respectively the x- and y-value
+            sinus, cosinus: the trigonometric function of the angle between the main and secondary side
+            int_matrix: The interpolation matrix between the main and the secondary side
+
+        '''
+        self.matrix_scipy[:,main_0] += self.matrix_scipy[:,secondary_0] @ int_matrix * cosinus + self.matrix_scipy[:,secondary_1] @ int_matrix * sinus
+        self.matrix_scipy[main_0,:] += int_matrix.T @ self.matrix_scipy[secondary_0,:] * cosinus + int_matrix.T @ self.matrix_scipy[secondary_1,:]  * sinus
+        self.matrix_scipy[:,main_1] += self.matrix_scipy[:,secondary_1] @ int_matrix * cosinus - self.matrix_scipy[:,secondary_0] @ int_matrix * sinus
+        self.matrix_scipy[main_1,:] += int_matrix.T @ self.matrix_scipy[secondary_1,:]  * cosinus - int_matrix.T @ self.matrix_scipy[secondary_0,:] * sinus
+        
+
+    def _set_zeros(
+            self, secondary: list[int]
+        ) -> None:
+        '''Sets all values of the matrix or vector for given indices of a row to zero
+        
+        Args:
+            secondary: a list of indices
+
+        '''
         if self.tensor_type == fenics.PETScMatrix:
-            # Slave Zeilen und Spalten werden auf die entprechende Master Zeile und Spalte addiert
-            self.matrix_scipy[:,dofs_m] += self.matrix_scipy[:,dofs_s] @ int_matrix
-            self.matrix_scipy[dofs_m,:] += int_matrix.T @ self.matrix_scipy[dofs_s,:]
-            # Slave Zeilen und Spalten nullen
-            self.matrix_scipy[dofs_s,:] = 0
-            self.matrix_scipy[:,dofs_s] = 0
-
-            # Anpassen der Slave Zeilen und des Lösungsvektors
-            for index_s, dof_s in enumerate(dofs_s):
-                self.matrix_scipy[dof_s,dof_s] = 1
-                self.matrix_scipy[dof_s,dofs_m] = -int_matrix[index_s,:]
-
+            self.matrix_scipy[secondary,:] = 0
+            self.matrix_scipy[:,secondary] = 0
         elif self.tensor_type == fenics.PETScVector:
-            self.vector[dofs_m] += int_matrix.T @ self.vector[dofs_s]
+            for dof_s in secondary:
+                self.vector[dof_s] = 0
 
-            for index_s, dof_s in enumerate(dofs_s):
-                        self.vector[dof_s] = 0
 
-    def matrix_manipulation_vector(self, dofs_m_x, dofs_s_x, dofs_m_y, dofs_s_y, int_matrix):
-        # Berechne Winkel. Annahme: Strecken ohne Knick, Dreiecksberechnung
-        vec_m = [self.dof_coord[dofs_m_x[0]][0]-self.dof_coord[dofs_m_x[-1]][0],self.dof_coord[dofs_m_x[0]][1]-self.dof_coord[dofs_m_x[-1]][1]]
-        vec_s = [self.dof_coord[dofs_s_x[0]][0]-self.dof_coord[dofs_s_x[-1]][0],self.dof_coord[dofs_s_x[0]][1]-self.dof_coord[dofs_s_x[-1]][1]]
+    def _set_periodic_constraints(
+            self, 
+            main_0: list[int], 
+            main_1: list[int], 
+            secondary: list[int], 
+            sinus: float, 
+            cosinus: float, 
+            int_matrix: np.NDArray[float]
+        ) -> None:
+        ''' Sets the constrains, that every secondary dof is only determined by the corresponding main dofs
+        
+        Args:
+            main_0, main_1: the dofs on the main side, respectively the x- and y-value
+            secondary: the dofs on the secondary side, x- or y-value
+            sinus, cosinus: the trigonometric function of the angle between the main and secondary side
+            int_matrix: The interpolation matrix between the main and the secondary side
+
+        '''
+        for index_s, dof_s in enumerate(secondary):
+            self.matrix_scipy[dof_s, dof_s] = 1
+            self.matrix_scipy[dof_s, main_0] = - int_matrix[index_s,:]*cosinus
+            if not len(main_1) == 0:
+                self.matrix_scipy[dof_s, main_1] = + int_matrix[index_s,:]*sinus
+
+
+    def _calculate_rotation(
+            self, main: list[int], secondary: list[int]
+        ) -> tuple[float]:
+        '''Calculates the sinus and cosinus of the angle between the main and the secondary side
+        
+        Args:   
+            main: the dofs on the main side
+            secondary: the dofs on the secondary side
+
+        Returns:
+            sinus, cosinus: a tuple of the trigonometric functions of the angle
+
+        '''
+        vec_m = [self.dof_coord[main[0]][0]-self.dof_coord[main[-1]][0],self.dof_coord[main[0]][1]-self.dof_coord[main[-1]][1]]
+        vec_s = [self.dof_coord[secondary[0]][0]-self.dof_coord[secondary[-1]][0],self.dof_coord[secondary[0]][1]-self.dof_coord[secondary[-1]][1]]
         
         self.rotation = np.arccos(np.round((vec_m[0]*vec_s[0]+vec_m[1]*vec_s[1])/(vec_m[0]**2+vec_m[1]**2)**(1/2)/(vec_s[0]**2+vec_s[1]**2)**(1/2),6))
         theta = np.arccos((vec_s[0])/(vec_s[0]**2+vec_s[1]**2)**(1/2))
@@ -935,225 +1137,165 @@ class PeriodicBoundaryInterpolator:
         sinus = np.round(np.sin(self.rotation), 6)
         cosinus = np.round(np.cos(self.rotation), 6)
 
+        return sinus, cosinus
+
+
+    def _implement_pbc_scalarfield(
+            self, dofs_m: list[int], dofs_s: list[int], int_matrix: np.NDArray[float]
+        ) -> None:
+        '''Changes the rows and columns of a Matrix or a Vector in the corresponding rows and columms
+        for a scalarfunction
+        
+        Args:
+            dofs_m: The dofs on the main side
+            dofs_s: The dofs on the secondary side
+            int_matrix: The interpolation matrix between the main and the secondary side
+
+        '''
         if self.tensor_type == fenics.PETScMatrix:
-            # Slave Zeilen und Spalten werden auf die entprechende Master Zeile und Spalte addiert
-            self.matrix_scipy[:,dofs_m_x] += self.matrix_scipy[:,dofs_s_x] @ int_matrix * cosinus + self.matrix_scipy[:,dofs_s_y] @ int_matrix * sinus
-            self.matrix_scipy[dofs_m_x,:] += int_matrix.T @ self.matrix_scipy[dofs_s_x,:] * cosinus + int_matrix.T @ self.matrix_scipy[dofs_s_y,:]  * sinus
-            self.matrix_scipy[:,dofs_m_y] += self.matrix_scipy[:,dofs_s_y] @ int_matrix * cosinus - self.matrix_scipy[:,dofs_s_x] @ int_matrix * sinus
-            self.matrix_scipy[dofs_m_y,:] += int_matrix.T @ self.matrix_scipy[dofs_s_y,:]  * cosinus - int_matrix.T @ self.matrix_scipy[dofs_s_x,:] * sinus
+            self.matrix_scipy[:,dofs_m] += self.matrix_scipy[:,dofs_s] @ int_matrix
+            self.matrix_scipy[dofs_m,:] += int_matrix.T @ self.matrix_scipy[dofs_s,:]
+            self._set_zeros(dofs_s)
 
-            # Slave Zeilen und Spalten nullen
-            self.matrix_scipy[dofs_s_x,:] = 0
-            self.matrix_scipy[:,dofs_s_x] = 0
-            self.matrix_scipy[dofs_s_y,:] = 0
-            self.matrix_scipy[:,dofs_s_y] = 0
+            self._set_periodic_constraints(dofs_m, [], dofs_s, 0, 1, int_matrix)
+
+        elif self.tensor_type == fenics.PETScVector:
+            self.vector[dofs_m] += int_matrix.T @ self.vector[dofs_s]
+
+            self._set_zeros(dofs_s)
+
+
+    def _implement_pbc_vectorfield(
+            self, dofs_m_x: list[int], dofs_s_x: list[int], dofs_m_y: list[int], dofs_s_y: list[int], int_matrix: np.NDArray[float]
+        ) -> None:
+        '''Changes the rows and columns of a Matrix or a Vector in the corresponding rows and columms
+        for a vectorfunction
+        
+        Args:
+            dofs_m_x: The dofs on the main side, specfically the x-value of the vector
+            dofs_s_x: The dofs on the secondary side, specfically the x-value of the vector
+            dofs_m_y: The dofs on the main side, specfically the y-value of the vector
+            dofs_s_y: The dofs on the secondary side, specfically the y-value of the vector
+            int_matrix: The interpolation matrix between the main and the secondary side
+
+        '''
+        sinus, cosinus = self._calculate_rotation(dofs_m_x, dofs_s_x)
+
+        if self.tensor_type == fenics.PETScMatrix:
+            self._copy_rows(dofs_m_x, dofs_m_y, dofs_s_x, dofs_s_y, sinus, cosinus, int_matrix)
+
+            self._set_zeros(dofs_s_x)
+            self._set_zeros(dofs_s_y)
             
-            for index_s_x, dof_s_x in enumerate(dofs_s_x):
-                self.matrix_scipy[dof_s_x,dof_s_x] = 1
-                self.matrix_scipy[dof_s_x,dofs_m_x] = - int_matrix[index_s_x,:]*cosinus
-                self.matrix_scipy[dof_s_x,dofs_m_y] = + int_matrix[index_s_x,:]*sinus
-
-            for index_s_y, dof_s_y in enumerate(dofs_s_y):
-                self.matrix_scipy[dof_s_y,dof_s_y] = 1
-                self.matrix_scipy[dof_s_y,dofs_m_y] = - int_matrix[index_s_y,:]*cosinus
-                self.matrix_scipy[dof_s_y,dofs_m_x] = - int_matrix[index_s_y,:]*sinus
+            self._set_periodic_constraints(dofs_m_x, dofs_m_y, dofs_s_x, sinus, cosinus, int_matrix)
+            self._set_periodic_constraints(dofs_m_y, dofs_m_x, dofs_s_y, -sinus, cosinus, int_matrix)
 
         elif self.tensor_type == fenics.PETScVector:
             self.vector[dofs_m_x] += int_matrix.T @ self.vector[dofs_s_x] * cosinus + int_matrix.T @ self.vector[dofs_s_y]  * sinus
             self.vector[dofs_m_y] += int_matrix.T @ self.vector[dofs_s_y]  * cosinus - int_matrix.T @ self.vector[dofs_s_x] * sinus
-            for index_s_x, dof_s_x in enumerate(dofs_s_x):
-                self.vector[dof_s_x] = 0
-            for index_s_y, dof_s_y in enumerate(dofs_s_y):
-                self.vector[dof_s_y] = 0
+            self._set_zeros(dofs_s_x)
+            self._set_zeros(dofs_s_y)
 
-    def assemble_periodic_system(self, boundary_ind_master, boundary_ind_slave):
-        noslipx = fenics.Constant((-5.0, 0.0))
-        noslipy = fenics.Constant((0.0, -5.0))
-        noslip = fenics.Constant(-5.0)
-        aux_bcs = []
+
+    def apply_periodic_bcs(
+            self, tensor: fenics.PETScMatrix | fenics.PETScVector
+        ) -> fenics.PETSc.Mat | fenics.PETSc.Vec:
+        '''Rewrites a Matrix or Vector to implement periodic boundary conditions
         
-        # Create auxiliary Dirichleit Conditions to obtain dof coordinates
+        Args: 
+            A PETScMatrix or a PETScVector
+
+        Returns:
+            The corresponding PETScMatrix or PETScVector with the applied Periodic Boundary Conditions
+            
+        '''
+        self.tensor_type = type(tensor)
+
+        if self.tensor_type == fenics.PETScMatrix:
+            self.matrix = fenics.as_backend_type(tensor).mat()
+            self.matrix_scipy = csr_matrix(self.matrix.getValuesCSR()[::-1],shape=self.matrix.size)
+        
+        elif self.tensor_type == fenics.PETScVector:
+            self.vector = fenics.as_backend_type(tensor).vec()
+
         if self.functionspace.num_sub_spaces() == 0:
-            aux_bcs += forms_module.create_dirichlet_bcs(self.functionspace, noslip, self.boundaries, boundary_ind_master)
-            aux_bcs += forms_module.create_dirichlet_bcs(self.functionspace, noslip, self.boundaries, boundary_ind_slave)
+            degree = self.functionspace.ufl_element().degree()
+
+            _, dofs_node_btwn_coordinates = self._split_dof_coordinates(1, 0)
+
+            int_matrix_node = create_interpolation_matrix(dofs_node_btwn_coordinates[0],dofs_node_btwn_coordinates[1],degree)
+
+            self._implement_pbc_scalarfield(self.sorted_indices[0], self.sorted_indices[1], int_matrix_node)
 
         elif isinstance(self.functionspace.ufl_element(), fenics.VectorElement):
-            aux_bcs += forms_module.create_dirichlet_bcs(self.functionspace, noslipx, self.boundaries, boundary_ind_master)
-            aux_bcs += forms_module.create_dirichlet_bcs(self.functionspace, noslipx, self.boundaries, boundary_ind_slave)
-            aux_bcs += forms_module.create_dirichlet_bcs(self.functionspace, noslipy, self.boundaries, boundary_ind_master)
-            aux_bcs += forms_module.create_dirichlet_bcs(self.functionspace, noslipy, self.boundaries, boundary_ind_slave)
+            degree = self.functionspace.ufl_element().degree()
 
-        elif isinstance(self.functionspace.ufl_element(), fenics.MixedElement):
-            for subspace_index in range(self.functionspace.num_sub_spaces()):
-                if self.functionspace.sub(subspace_index).num_sub_spaces() == 0:
-                    aux_bcs += forms_module.create_dirichlet_bcs(self.functionspace.sub(subspace_index), noslip, self.boundaries, boundary_ind_master)
-                    aux_bcs += forms_module.create_dirichlet_bcs(self.functionspace.sub(subspace_index), noslip, self.boundaries, boundary_ind_slave)
-                elif isinstance(self.functionspace.sub(subspace_index).ufl_element(), fenics.VectorElement):
-                    aux_bcs += forms_module.create_dirichlet_bcs(self.functionspace.sub(subspace_index), noslipx, self.boundaries, boundary_ind_master)
-                    aux_bcs += forms_module.create_dirichlet_bcs(self.functionspace.sub(subspace_index), noslipx, self.boundaries, boundary_ind_slave)
-                    aux_bcs += forms_module.create_dirichlet_bcs(self.functionspace.sub(subspace_index), noslipy, self.boundaries, boundary_ind_master)
-                    aux_bcs += forms_module.create_dirichlet_bcs(self.functionspace.sub(subspace_index), noslipy, self.boundaries, boundary_ind_slave)
-                else:
-                    print(self.functionspace.sub(subspace_index).num_sub_spaces())
-                    raise RuntimeError("subspace dimension not fitting")
-                
-        else:
-            raise RuntimeError("function spaces not fitting")
+            if degree == 2 or degree == 3:
+                dofs_node_btwn, dofs_node_btwn_coordinates = self._split_dof_coordinates(3, 0)
 
-        # Find dof coordinates for velocity and pressure with dummy functions and sort them
-        for i, bc in enumerate(aux_bcs):
-            t = fenics.Function(self.functionspace)
-            tv = t.vector()
-            bc.apply(tv)
-            structured_indices = np.where(abs(np.array(tv)+5.0) < fenics.DOLFIN_EPS_LARGE)[0]
-            self.sorted_indices += [structured_indices[np.argsort(abs(self.dof_coord[:,1][structured_indices])+abs(self.dof_coord[:,0][structured_indices]))].astype('int32')]
+                int_matrix_node = create_interpolation_matrix(dofs_node_btwn_coordinates[0],dofs_node_btwn_coordinates[2],degree)
+                int_matrix_btwn = create_interpolation_matrix(dofs_node_btwn_coordinates[1],dofs_node_btwn_coordinates[3],degree)
+
+                self._implement_pbc_vectorfield(dofs_node_btwn[0][1:], dofs_node_btwn[2][1:], dofs_node_btwn[4][1:], dofs_node_btwn[6][1:], int_matrix_node[1:,1:])
+                self._implement_pbc_vectorfield(dofs_node_btwn[1], dofs_node_btwn[3], dofs_node_btwn[5], dofs_node_btwn[7], int_matrix_btwn)
             
-        # Matrix Manipulation
-        if self.functionspace.num_sub_spaces() == 0:
-            interp_type = self.get_interp_type(self.functionspace)
-            dofs_node_btwn_coordinates = [[0],[0]]
-
-            # Get the relative distances of the dofs (starting at 0), to get a 1d array for the interpolation matrix
-            for i in range(2):
-                for index, dof in enumerate(self.sorted_indices[i]):
-                    if index < len(self.sorted_indices[i])-1:
-                        dofs_node_btwn_coordinates[i] += [((self.dof_coord[dof][1] - self.dof_coord[self.sorted_indices[i][index+1]][1])**2
-                                                        +(self.dof_coord[dof][0] - self.dof_coord[self.sorted_indices[i][index+1]][0])**2)**(1/2) 
-                                                        + dofs_node_btwn_coordinates[i][index]]
-            
-            # create interpolation matrix and manipulate the scipy matrix
-            int_matrix_node = self.create_interpolation_matrix(dofs_node_btwn_coordinates[0],dofs_node_btwn_coordinates[1],interp_type)
-            self.matrix_manipulation_scalar(self.sorted_indices[0], self.sorted_indices[1], int_matrix_node)
-
-        elif isinstance(self.functionspace.ufl_element(), fenics.VectorElement):
-            interp_type = self.get_interp_type(self.functionspace)
-
-            if interp_type == 'quadratic' or interp_type == 'cubic':
-                dofs_node_btwn = [[],[],[],[],[],[],[],[]] # master x, slave x, master y, slave y *2 node, side
-                dofs_node_btwn_coordinates = [[0],[0],[0],[0]]
-
-                for i in range(4):
-                    for index, dof in enumerate(self.sorted_indices[i]):
-                        if index%2 == 0:
-                            dofs_node_btwn[i*2] += [dof]
-                        else:
-                            dofs_node_btwn[i*2+1] += [dof]
+            elif degree == 1:
+                _, dofs_node_btwn_coordinates = self._split_dof_coordinates(1, 0)
                 
-                for i in range(4):
-                    for index, dof in enumerate(dofs_node_btwn[i]):
-                        if index < len(dofs_node_btwn[i])-1:
-                            dofs_node_btwn_coordinates[i] += [((self.dof_coord[dof][1] - self.dof_coord[dofs_node_btwn[i][index+1]][1])**2
-                                                            +(self.dof_coord[dof][0] - self.dof_coord[dofs_node_btwn[i][index+1]][0])**2)**(1/2) 
-                                                            + dofs_node_btwn_coordinates[i][index]]
+                int_matrix_node = create_interpolation_matrix(dofs_node_btwn_coordinates[0],dofs_node_btwn_coordinates[1],degree)
 
-                int_matrix_node = self.create_interpolation_matrix(dofs_node_btwn_coordinates[0],dofs_node_btwn_coordinates[2],interp_type)
-                int_matrix_btwn = self.create_interpolation_matrix(dofs_node_btwn_coordinates[1],dofs_node_btwn_coordinates[3],interp_type)
-                self.matrix_manipulation_vector(dofs_node_btwn[0][1:], dofs_node_btwn[2][1:], dofs_node_btwn[4][1:], dofs_node_btwn[6][1:], int_matrix_node[1:,1:])
-                self.matrix_manipulation_vector(dofs_node_btwn[1], dofs_node_btwn[3], dofs_node_btwn[5], dofs_node_btwn[7], int_matrix_btwn)
-            
-            elif interp_type == 'linear':
-                dofs_node_btwn_coordinates = [[0],[0]]
-
-                for i in range(2):
-                    for index, dof in enumerate(self.sorted_indices[i]):
-                        if index < len(self.sorted_indices[i])-1:
-                            dofs_node_btwn_coordinates[i] += [((self.dof_coord[dof][1] - self.dof_coord[self.sorted_indices[i][index+1]][1])**2
-                                                            +(self.dof_coord[dof][0] - self.dof_coord[self.sorted_indices[i][index+1]][0])**2)**(1/2) 
-                                                            + dofs_node_btwn_coordinates[i][index]]
-                
-                int_matrix_node = self.create_interpolation_matrix(dofs_node_btwn_coordinates[0],dofs_node_btwn_coordinates[1],interp_type)
-                self.matrix_manipulation_vector(self.sorted_indices[0][1:], self.sorted_indices[1][1:], self.sorted_indices[2][1:], self.sorted_indices[3][1:], int_matrix_node[1:,1:])
+                self._implement_pbc_vectorfield(self.sorted_indices[0][1:], self.sorted_indices[1][1:], self.sorted_indices[2][1:], self.sorted_indices[3][1:], int_matrix_node[1:,1:])
             
         elif isinstance(self.functionspace.ufl_element(), fenics.MixedElement):
-            counter = 0
+            subspace_counter = 0
 
             for subspace_index in range(self.functionspace.num_sub_spaces()):
-                interp_type = self.get_interp_type(self.functionspace.sub(subspace_index))
+                degree = self.functionspace.ufl_element().degree()
 
                 if self.functionspace.sub(subspace_index).num_sub_spaces() == 0:
-                    if interp_type == 'linear':
-                        dofs_node_btwn_coordinates = [[0],[0]]
+                    if degree == 1:
+                        _, dofs_node_btwn_coordinates = self._split_dof_coordinates(1, subspace_counter)
                         
-                        for i in range(2):
-                            for index, dof in enumerate(self.sorted_indices[2*counter+i]):
-                                if index < len(self.sorted_indices[2*counter+i])-1:
-                                    dofs_node_btwn_coordinates[i] += [((self.dof_coord[dof][1] - self.dof_coord[self.sorted_indices[2*counter+i][index+1]][1])**2
-                                                                    +(self.dof_coord[dof][0] - self.dof_coord[self.sorted_indices[2*counter+i][index+1]][0])**2)**(1/2) 
-                                                                    + dofs_node_btwn_coordinates[i][index]]
+                        int_matrix_node = create_interpolation_matrix(dofs_node_btwn_coordinates[0],dofs_node_btwn_coordinates[1],degree)
                         
-                        int_matrix_node = self.create_interpolation_matrix(dofs_node_btwn_coordinates[0],dofs_node_btwn_coordinates[1],interp_type)
-                        self.matrix_manipulation_scalar(self.sorted_indices[2*counter], self.sorted_indices[2*counter+1], int_matrix_node)
+                        self._implement_pbc_scalarfield(self.sorted_indices[2*subspace_counter], self.sorted_indices[2*subspace_counter+1], int_matrix_node)
                     
                     else:
-                        dofs_node_btwn = [[],[],[],[]]
-                        dofs_node_btwn_coordinates = [[0],[0],[0],[0]]
+                        dofs_node_btwn, dofs_node_btwn_coordinates = self._split_dof_coordinates(2, subspace_counter)
 
-                        for i in range(2):
-                            for index, dof in enumerate(self.sorted_indices[2*counter+i]):
-                                if index%2 == 0:
-                                    dofs_node_btwn[i*2] += [dof]
-                                else:
-                                    dofs_node_btwn[i*2+1] += [dof]
-                        
-                        for i in range(4):
-                            for index, dof in enumerate(dofs_node_btwn[i]):
-                                if index < len(dofs_node_btwn[i])-1:
-                                    dofs_node_btwn_coordinates[i] += [((self.dof_coord[dof][1] - self.dof_coord[dofs_node_btwn[i][index+1]][1])**2
-                                                                    +(self.dof_coord[dof][0] - self.dof_coord[dofs_node_btwn[i][index+1]][0])**2)**(1/2) 
-                                                                    + dofs_node_btwn_coordinates[i][index]]
+                        int_matrix_node = create_interpolation_matrix(dofs_node_btwn_coordinates[0],dofs_node_btwn_coordinates[2],degree)
+                        int_matrix_btwn = create_interpolation_matrix(dofs_node_btwn_coordinates[1],dofs_node_btwn_coordinates[3],degree)
 
-                        int_matrix_node = self.create_interpolation_matrix(dofs_node_btwn_coordinates[0],dofs_node_btwn_coordinates[2],interp_type)
-                        int_matrix_btwn = self.create_interpolation_matrix(dofs_node_btwn_coordinates[1],dofs_node_btwn_coordinates[3],interp_type)
-                        self.matrix_manipulation_scalar(dofs_node_btwn[0][1:], dofs_node_btwn[2][1:], int_matrix_node[1:,1:])
-                        self.matrix_manipulation_scalar(dofs_node_btwn[1], dofs_node_btwn[3], int_matrix_btwn)
+                        self._implement_pbc_scalarfield(dofs_node_btwn[0][1:], dofs_node_btwn[2][1:], int_matrix_node[1:,1:])
+                        self._implement_pbc_scalarfield(dofs_node_btwn[1], dofs_node_btwn[3], int_matrix_btwn)
                     
-                    counter += 1
+                    subspace_counter += 1
                 
                 elif isinstance(self.functionspace.sub(subspace_index).ufl_element(), fenics.VectorElement):
-                    if interp_type == 'quadratic' or interp_type == 'cubic':
-                        dofs_node_btwn = [[],[],[],[],[],[],[],[]]
-                        dofs_node_btwn_coordinates = [[0],[0],[0],[0]]
-
-                        for i in range(4):
-                            for index, dof in enumerate(self.sorted_indices[2*counter+i]):
-                                if index%2 == 0:
-                                    dofs_node_btwn[i*2] += [dof]
-                                else:
-                                    dofs_node_btwn[i*2+1] += [dof]
-
-                        for i in range(4):
-                            for index, dof in enumerate(dofs_node_btwn[i]):
-                                if index < len(dofs_node_btwn[i])-1:
-                                    dofs_node_btwn_coordinates[i] += [((self.dof_coord[dof][1] - self.dof_coord[dofs_node_btwn[i][index+1]][1])**2
-                                                                    +(self.dof_coord[dof][0] - self.dof_coord[dofs_node_btwn[i][index+1]][0])**2)**(1/2) 
-                                                                    + dofs_node_btwn_coordinates[i][index]]
+                    if degree == 2 or degree == 3:
+                        dofs_node_btwn, dofs_node_btwn_coordinates = self._split_dof_coordinates(3, subspace_counter)
                         
-                        int_matrix_node = self.create_interpolation_matrix(dofs_node_btwn_coordinates[0],dofs_node_btwn_coordinates[2],interp_type)
-                        int_matrix_btwn = self.create_interpolation_matrix(dofs_node_btwn_coordinates[1],dofs_node_btwn_coordinates[3],interp_type)
-                        self.matrix_manipulation_vector(dofs_node_btwn[0], dofs_node_btwn[2], dofs_node_btwn[4], dofs_node_btwn[6], int_matrix_node)
-                        self.matrix_manipulation_vector(dofs_node_btwn[1], dofs_node_btwn[3], dofs_node_btwn[5], dofs_node_btwn[7], int_matrix_btwn)
+                        int_matrix_node = create_interpolation_matrix(dofs_node_btwn_coordinates[0],dofs_node_btwn_coordinates[2],degree)
+                        int_matrix_btwn = create_interpolation_matrix(dofs_node_btwn_coordinates[1],dofs_node_btwn_coordinates[3],degree)
+
+                        self._implement_pbc_vectorfield(dofs_node_btwn[0], dofs_node_btwn[2], dofs_node_btwn[4], dofs_node_btwn[6], int_matrix_node)
+                        self._implement_pbc_vectorfield(dofs_node_btwn[1], dofs_node_btwn[3], dofs_node_btwn[5], dofs_node_btwn[7], int_matrix_btwn)
                     
-                    elif interp_type == 'linear':
-                        dofs_node_btwn_coordinates = [[0],[0]]
-
-                        for i in range(2):
-                            for index, dof in enumerate(self.sorted_indices[2*counter+i]):
-                                if index < len(self.sorted_indices[2*counter+i])-1:
-                                    dofs_node_btwn_coordinates[i] += [((self.dof_coord[dof][1] - self.dof_coord[self.sorted_indices[2*counter+i][index+1]][1])**2
-                                                                    +(self.dof_coord[dof][0] - self.dof_coord[self.sorted_indices[2*counter+i][index+1]][0])**2)**(1/2) 
-                                                                    + dofs_node_btwn_coordinates[i][index]]
+                    elif degree == 1:
+                        _, dofs_node_btwn_coordinates = self._split_dof_coordinates(1, subspace_counter)
                         
-                        int_matrix_node = self.create_interpolation_matrix(dofs_node_btwn_coordinates[0],dofs_node_btwn_coordinates[1],interp_type)
-                        self.matrix_manipulation_vector(self.sorted_indices[2*counter], self.sorted_indices[2*counter+1], self.sorted_indices[2*counter+2], self.sorted_indices[2*counter+3], int_matrix_node)
-        
-                    counter += 2
+                        int_matrix_node = create_interpolation_matrix(dofs_node_btwn_coordinates[0],dofs_node_btwn_coordinates[1],degree)
 
-        # Matrix zurückgeben
+                        self._implement_pbc_vectorfield(self.sorted_indices[2*subspace_counter], self.sorted_indices[2*subspace_counter+1], self.sorted_indices[2*subspace_counter+2], self.sorted_indices[2*subspace_counter+3], int_matrix_node)
+        
+                    subspace_counter += 2
+        
         if self.tensor_type == fenics.PETScMatrix:
             self.matrix = scipy2petsc(self.matrix_scipy, self.mesh.mpi_comm())
             A_wrap = fenics.PETScMatrix(self.matrix)
             A = fenics.as_backend_type(A_wrap).mat()
             return A
+        
         elif self.tensor_type == fenics.PETScVector:
             b_wrap = fenics.PETScVector(self.vector)
             b = fenics.as_backend_type(b_wrap).vec()
