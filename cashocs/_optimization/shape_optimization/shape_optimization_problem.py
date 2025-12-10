@@ -77,9 +77,9 @@ class ShapeOptimizationProblem(optimization_problem.OptimizationProblem):
         self,
         state_forms: list[ufl.Form] | ufl.Form,
         bcs_list: (
-            list[list[fenics.DirichletBC]]
-            | list[fenics.DirichletBC]
-            | fenics.DirichletBC
+            list[list[fenics.DirichletBC | _utils.PeriodicBC]]
+            | list[fenics.DirichletBC | _utils.PeriodicBC]
+            | fenics.DirichletBC | _utils.PeriodicBC
         ),
         cost_functional_form: list[_typing.CostFunctional] | _typing.CostFunctional,
         states: list[fenics.Function] | fenics.Function,
@@ -92,6 +92,12 @@ class ShapeOptimizationProblem(optimization_problem.OptimizationProblem):
         adjoint_ksp_options: _typing.KspOption | list[_typing.KspOption] | None = None,
         gradient_ksp_options: _typing.KspOption | list[_typing.KspOption] | None = None,
         desired_weights: list[float] | None = None,
+        shape_bcs_list: (
+            list[list[fenics.DirichletBC | _utils.PeriodicBC]]
+            | list[fenics.DirichletBC | _utils.PeriodicBC]
+            | fenics.DirichletBC | _utils.PeriodicBC
+            | None
+        ) = None,
         temp_dict: dict | None = None,
         initial_function_values: list[float] | None = None,
         preconditioner_forms: list[ufl.Form] | ufl.Form | None = None,
@@ -291,6 +297,8 @@ class ShapeOptimizationProblem(optimization_problem.OptimizationProblem):
         self.form_handler: _forms.ShapeFormHandler = _forms.ShapeFormHandler(
             self, self.db, self.shape_regularization
         )
+
+        self.form_handler.setup_pbcs_shape(shape_bcs_list)
 
         if self.db.parameter_db.temp_dict:
             self.db.parameter_db.temp_dict["Regularization"] = {
@@ -589,9 +597,9 @@ class ShapeOptimizationProblem(optimization_problem.OptimizationProblem):
         shape_derivative: ufl.Form,
         adjoint_forms: ufl.Form | list[ufl.Form],
         adjoint_bcs_list: (
-            fenics.DirichletBC
-            | list[fenics.DirichletBC]
-            | list[list[fenics.DirichletBC]]
+            fenics.DirichletBC | _utils.PeriodicBC
+            | list[fenics.DirichletBC | _utils.PeriodicBC]
+            | list[list[fenics.DirichletBC | _utils.PeriodicBC]]
         ),
     ) -> None:
         """Overrides both adjoint system and shape derivative with user input.

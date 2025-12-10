@@ -156,6 +156,17 @@ class ShapeGradientProblem(pde_problem.PDEProblem):
                     b=self.form_handler.fe_shape_derivative_vector.vec(),
                     ksp_options=self.ksp_options,
                 )
+                
+                for pbc_shape in self.form_handler.pbcs_shape:
+                    PBI = _utils.PeriodicBoundaryInterpolator(pbc_shape)
+                    self.form_handler.fe_shape_derivative_vector = fenics.PETScVector(
+                        PBI.apply_periodic_bcs(
+                        fenics.PETScVector(self.form_handler.fe_shape_derivative_vector.vec())
+                        ))
+                    self.form_handler.scalar_product_matrix = PBI.apply_periodic_bcs(
+                        fenics.PETScMatrix(self.form_handler.scalar_product_matrix)
+                        )
+                
                 self.form_handler.apply_shape_bcs(self.db.function_db.gradient[0])
 
                 self.has_solution = True

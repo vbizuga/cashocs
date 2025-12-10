@@ -586,6 +586,27 @@ class ShapeFormHandler(form_handler.FormHandler):
             )
 
         return bcs_shape
+    
+    def setup_pbcs_shape(
+        self,
+        shape_bdry_periodic,
+    ) -> list[_utils.PeriodicBC]:
+        """Defines the boundary conditions for the shape deformation.
+
+        Returns:
+            The list of periodic boundary conditions
+
+        """
+        self.pbcs_shape = []
+
+        for bc in shape_bdry_periodic:
+            if type(bc) == _utils.PeriodicBC:
+                self.pbcs_shape += _utils.create_periodic_bcs(
+                    self.db.function_db.control_spaces[0],
+                    self.boundaries,
+                    [bc.main_idc, bc.secondary_idc],
+                    bc.constrained_domain
+                )
 
     def _setup_bcs_extension(self) -> list[fenics.DirichletBC]:
         """Defines the DirichletBCs for the re-extensions of the gradient deformation.
