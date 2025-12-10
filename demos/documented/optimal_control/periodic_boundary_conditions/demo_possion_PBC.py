@@ -67,6 +67,7 @@ config = cashocs.load_config("config.ini")
 mesh, subdomains, boundaries, dx, ds, dS = cashocs.regular_mesh(25)
 
 # To keep it simnple, the function space and problem formulation are also adopted.
+#+
 
 V = FunctionSpace(mesh, "CG", 1)
 
@@ -75,19 +76,39 @@ p = Function(V)
 u = Function(V)
 e = inner(grad(y), grad(p)) * dx - u * p * dx
 
+# -
+# For the implementation fo the periodic boundary conditions it is required to
+# create a Fenics Subdomain as a PeriodicBoundary class with a function {python}`map`.
+# The latter is a function that takes the main and secondary side and maps the main
+# on the secondary side via rotation and translation. In this is example it should be
+# defined as
+# +
+
+class PeriodicBoundary(SubDomain):
+
+    def inside(self, x, on_boundary):
+        return bool(x[1] < DOLFIN_EPS)
+
+    def map(self, x, y):
+        y[0] = x[0] - 1
+        y[1] = x[1]
+        return y
+    
+periodicboundary = PeriodicBoundary()
+
 #-
 # The (homogeneous) Dirichlet boundary conditions can be specified via 
 
 dbc = cashocs.create_dirichlet_bcs(V, Constant(0), boundaries, [3, 4])
 
-# To implement periodic bopundary conditions, in this example mapping the left side (index 1) to the right
-# side (index 2), one needs an additional function {py:func}`create_periodic_bcs <cashocs.create_periodic_bcs>`
+# To implement periodic bopundary conditions, in this example mapping the left side (index 1, main) to the right
+# side (index 2, secondary), one needs an additional function {py:func}`create_periodic_bcs <cashocs.create_periodic_bcs>`
 # implementing the periodic boundary conditions.
 
-pbc = cashocs.create_periodic_bcs(V, boundaries, [1, 2])
+pbc = cashocs.create_periodic_bcs(V, boundaries, [1, 2], periodicboundary)
 
-# This function takes the function space, the boundaries, and a list of two indices of the
-# boundaries to be matched. The first index represents the master side and the second the slave side.
+# This function takes the function space, the boundaries, a list of two indices of the boundaries to be matched and 
+# the PeriodicBoundary SubDomain. The first index represents the main side and the second the secondary side.
 # Note that these two boundaries should have the same length. No spatial relation needs to be specified, 
 # as rotation and translation of the DOFs to be mapped are handled internally. The function creates a 
 # list of PeriodicBC objects, that can be added to the existing list of DirichletBCs:
