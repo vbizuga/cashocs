@@ -246,7 +246,7 @@ J = cashocs.IntegralFunctional(inner(grad(u), grad(u)) * dx)
 #
 # Finally, we solve the shape optimization problem as previously with the commands
 
-sop = cashocs.ShapeOptimizationProblem(e, bcs, J, up, vq, boundaries, config=config, shape_bcs_list = bc_periodic)
+sop = cashocs.ShapeOptimizationProblem(e, bcs, J, up, vq, boundaries, config=config)
 sop.solve()
 
 # :::{note}
@@ -306,8 +306,8 @@ plt.title("State variable p")
 
 plt.tight_layout()
 plt.show()
-# plt.savefig('./img_shape_stokes.png', dpi=150, bbox_inches='tight')
+# plt.savefig('./img_shape_stokes_PBC.png', dpi=150, bbox_inches='tight')
 # -
 
 # and the result is shown below
-# ![](/../../demos/documented/shape_optimization/shape_stokes/img_shape_stokes.png)
+# ![](/../../demos/documented/shape_optimization/shape_stokes_PBC/img_shape_stokes_PBC.png)
