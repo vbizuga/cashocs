@@ -181,7 +181,10 @@ class AdjointFormHandler:
                 [bc for bc in self.db.form_db.bcs_list[i] if type(bc) == _utils.PeriodicBC]
                 for i in range(self.db.parameter_db.state_dim)
             ]
-            bcs_list_ad = [[item for sublist in dbcs_list_ad + pbcs_list_ad for item in sublist]]
+            if len(pbcs_list_ad[0]) == 0:
+                bcs_list_ad = dbcs_list_ad
+            else:
+                bcs_list_ad = [[item for sublist in dbcs_list_ad + pbcs_list_ad for item in sublist]]
 
         else:
             bcs_list_ad = [

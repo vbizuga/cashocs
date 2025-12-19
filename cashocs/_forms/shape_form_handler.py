@@ -599,14 +599,15 @@ class ShapeFormHandler(form_handler.FormHandler):
         """
         self.pbcs_shape = []
 
-        for bc in shape_bdry_periodic:
-            if type(bc) == _utils.PeriodicBC:
-                self.pbcs_shape += _utils.create_periodic_bcs(
-                    self.db.function_db.control_spaces[0],
-                    self.boundaries,
-                    [bc.main_idc, bc.secondary_idc],
-                    bc.constrained_domain
-                )
+        if shape_bdry_periodic != None:
+            for bc in shape_bdry_periodic:
+                if type(bc) == _utils.PeriodicBC:
+                    self.pbcs_shape += _utils.create_periodic_bcs(
+                        self.db.function_db.control_spaces[0],
+                        self.boundaries,
+                        [bc.main_idc, bc.secondary_idc],
+                        bc.constrained_domain
+                    )
 
     def _setup_bcs_extension(self) -> list[fenics.DirichletBC]:
         """Defines the DirichletBCs for the re-extensions of the gradient deformation.

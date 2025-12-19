@@ -96,13 +96,18 @@ class ControlFormHandler(form_handler.FormHandler):
         self.modified_scalar_product = _utils.bilinear_boundary_form_modification(
             scalar_product_forms
         )
-        if bcs[0] is not None:
-            dbcs = [[bc for bc in bcs[i] if type(bc) != _utils.PeriodicBC]
-                    for i in range(len(bcs))]
-            pbcs = [[bc for bc in bcs[i] if type(bc) == _utils.PeriodicBC]
-                    for i in range(len(bcs))]
-        else:
-            dbcs, pbcs = [None], [None]
+        dbcs = []
+        pbcs = []
+
+        for sublist in bcs:
+            if sublist is None:
+                dbcs.append([])
+                pbcs.append([])
+            else:
+                dbcs_sublist = [bc for bc in sublist if not isinstance(bc, _utils.PeriodicBC)]
+                pbcs_sublist = [bc for bc in sublist if isinstance(bc, _utils.PeriodicBC)]
+                dbcs.append(dbcs_sublist)
+                pbcs.append(pbcs_sublist)
 
         try:
             self.assemblers.clear()
