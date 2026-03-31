@@ -168,20 +168,23 @@ class _NewtonSolver:
             self.dbcs = []
             self.pbcs = [bcs]
         
-        boundaries = self.pbcs[0].boundaries
-        periodic_tags = list([self.pbcs[0].main_idc, self.pbcs[0].secondary_idc])
-        if self.function_space.num_sub_spaces() == 0:
-            zero_vec = np.zeros(self.function_space.ufl_element().degree())
-        else:
-            dim = 0
-            for subspace_index in range(self.function_space.num_sub_spaces()):
-                if self.function_space.sub(subspace_index).num_sub_spaces() == 0:
-                    dim += 1
-                else:
-                    dim += self.function_space.sub(subspace_index).num_sub_spaces()
-        zero_vec = np.zeros(dim)
+        self.artificial_bcs_periodic = []
 
-        self.artificial_bcs_periodic = _utils.create_dirichlet_bcs(self.function_space, zero_vec, boundaries, periodic_tags)
+        for pbc in self.pbcs:
+            boundaries = pbc.boundaries
+            periodic_tags = list([pbc.main_idc, pbc.secondary_idc])
+            if self.function_space.num_sub_spaces() == 0:
+                zero_vec = np.zeros(self.function_space.ufl_element().degree())
+            else:
+                dim = 0
+                for subspace_index in range(self.function_space.num_sub_spaces()):
+                    if self.function_space.sub(subspace_index).num_sub_spaces() == 0:
+                        dim += 1
+                    else:
+                        dim += self.function_space.sub(subspace_index).num_sub_spaces()
+            zero_vec = np.zeros(dim)
+
+            self.artificial_bcs_periodic += _utils.create_dirichlet_bcs(self.function_space, zero_vec, boundaries, periodic_tags)
 
         self.assembler = fenics.SystemAssembler(
             self.derivative, self.nonlinear_form, self.dbcs
