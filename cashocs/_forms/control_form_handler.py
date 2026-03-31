@@ -135,11 +135,10 @@ class ControlFormHandler(form_handler.FormHandler):
 
             self.riesz_projection_matrices.append(fenics_matrix.mat())
         
-        lhs_form, rhs_form = _utils.split_linear_forms(modified_scalar_product_forms)
         for pbc in pbcs:
-            for fenics_matrix in self.riesz_projection_matrices:
+            for i, fenics_matrix in enumerate(self.riesz_projection_matrices):
                 matrix = fenics.PETScMatrix(fenics_matrix)
-                fenics_matrix = fenics.as_backend_type(_utils.assemble_petsc_system(lhs_form[0], rhs_form[0], pbc, matrix))[0]
+                fenics_matrix = fenics.as_backend_type(_utils.assemble_petsc_system(modified_scalar_product_forms[i], derivatives[i], pbc, matrix))
 
         # Test for symmetry of the scalar products
         for matrix in self.riesz_projection_matrices:

@@ -917,6 +917,7 @@ class PeriodicBoundaryInterpolator:
         self.rotation: float = None
 
 
+    @log.profile_execution_time("locating dofs", level = log.DEBUG)
     def _locate_dofs(
             self
         ) -> list[list[int]]:
@@ -970,7 +971,7 @@ class PeriodicBoundaryInterpolator:
                                                 +self.dof_coord[:,0][structured_indices])].astype('int32')]
             elif i%2 == 1:
                 reference_dof = [0,0]
-                reference_dof = self.constrained_domain.map(self.dof_coord[sorted_indices[i-1]][0,:], reference_dof)
+                reference_dof = self.constrained_domain.map(reference_dof, self.dof_coord[sorted_indices[i-1]][0,:])
                 sorted_indices += [
                     structured_indices[np.argsort(abs(reference_dof[1]
                                                 -self.dof_coord[:,1][structured_indices])**2
@@ -979,7 +980,7 @@ class PeriodicBoundaryInterpolator:
                 
         return sorted_indices
 
-
+    @log.profile_execution_time("splitting dof coordinates", level = log.DEBUG)
     def _split_dof_coordinates(
             self, dimension: int, counter: int
             ) -> tuple[list[list[int]], list[list[int]]]:
@@ -1043,7 +1044,7 @@ class PeriodicBoundaryInterpolator:
                         
         return dofs_node_btwn, dofs_node_btwn_coordinates
 
-
+    @log.profile_execution_time("copy rows", level = log.DEBUG)
     def _copy_rows(
             self, 
             main_0: list[int], 
@@ -1063,29 +1064,38 @@ class PeriodicBoundaryInterpolator:
             int_matrix: The interpolation matrix between the main and the secondary side
 
         '''
-        self.matrix_scipy[:,main_0] += self.matrix_scipy[:,secondary_0] @ int_matrix * cosinus + self.matrix_scipy[:,secondary_1] @ int_matrix * sinus
-        self.matrix_scipy[main_0,:] += int_matrix.T @ self.matrix_scipy[secondary_0,:] * cosinus + int_matrix.T @ self.matrix_scipy[secondary_1,:]  * sinus
-        self.matrix_scipy[:,main_1] += self.matrix_scipy[:,secondary_1] @ int_matrix * cosinus - self.matrix_scipy[:,secondary_0] @ int_matrix * sinus
-        self.matrix_scipy[main_1,:] += int_matrix.T @ self.matrix_scipy[secondary_1,:]  * cosinus - int_matrix.T @ self.matrix_scipy[secondary_0,:] * sinus
-        
+        int_matrix_t = int_matrix.T
+        self.matrix_scipy[:,main_0] += (self.matrix_scipy[:,secondary_0] * cosinus + self.matrix_scipy[:,secondary_1] * sinus) @ int_matrix
+        self.matrix_scipy[main_0,:] += int_matrix_t @ (self.matrix_scipy[secondary_0,:] * cosinus + self.matrix_scipy[secondary_1,:]  * sinus)
+        self.matrix_scipy[:,main_1] += (self.matrix_scipy[:,secondary_1] * cosinus - self.matrix_scipy[:,secondary_0] * sinus) @ int_matrix
+        self.matrix_scipy[main_1,:] += int_matrix_t @ (self.matrix_scipy[secondary_1,:]  * cosinus - self.matrix_scipy[secondary_0,:] * sinus)
 
+    @log.profile_execution_time("set rows to zero", level = log.DEBUG)
     def _set_zeros(
             self, secondary: list[int]
         ) -> None:
-        '''Sets all values of the matrix or vector for given indices of a row to zero
+        '''Sets all values of the matrix or vector for given indices of a row and column to zero
         
         Args:
             secondary: a list of indices
 
         '''
-        if self.tensor_type == fenics.PETScMatrix:
-            self.matrix_scipy[secondary,:] = 0
-            self.matrix_scipy[:,secondary] = 0
+        if self.tensor_type == fenics.PETScMatrix or self.tensor_type == PETSc.Mat:
+            secondary_set = set(secondary)
+            for i in range(self.matrix_scipy.shape[0]):
+                keep = [j for j, col in enumerate(self.matrix_scipy.rows[i]) if col not in secondary_set]
+                self.matrix_scipy.data[i] = [self.matrix_scipy.data[i][j] for j in keep]
+                self.matrix_scipy.rows[i] = [self.matrix_scipy.rows[i][j] for j in keep]
+
+            for idx in secondary:
+                self.matrix_scipy.data[idx] = []
+                self.matrix_scipy.rows[idx] = []
+        
         elif self.tensor_type == fenics.PETScVector:
             for dof_s in secondary:
                 self.vector[dof_s] = 0
 
-
+    @log.profile_execution_time("set periodic constrains", level = log.DEBUG)
     def _set_periodic_constraints(
             self, 
             main_0: list[int], 
@@ -1111,6 +1121,7 @@ class PeriodicBoundaryInterpolator:
                 self.matrix_scipy[dof_s, main_1] = + int_matrix[index_s,:]*sinus
 
 
+    @log.profile_execution_time("calculate rotation", level = log.DEBUG)
     def _calculate_rotation(
             self, main: list[int], secondary: list[int]
         ) -> tuple[float]:
@@ -1127,19 +1138,19 @@ class PeriodicBoundaryInterpolator:
         vec_m = [self.dof_coord[main[0]][0]-self.dof_coord[main[-1]][0],self.dof_coord[main[0]][1]-self.dof_coord[main[-1]][1]]
         vec_s = [self.dof_coord[secondary[0]][0]-self.dof_coord[secondary[-1]][0],self.dof_coord[secondary[0]][1]-self.dof_coord[secondary[-1]][1]]
         
-        self.rotation = np.arccos(np.round((vec_m[0]*vec_s[0]+vec_m[1]*vec_s[1])/(vec_m[0]**2+vec_m[1]**2)**(1/2)/(vec_s[0]**2+vec_s[1]**2)**(1/2),6))
+        self.rotation = np.arccos((vec_m[0]*vec_s[0]+vec_m[1]*vec_s[1])/(vec_m[0]**2+vec_m[1]**2)**(1/2)/(vec_s[0]**2+vec_s[1]**2)**(1/2))
         theta = np.arccos((vec_s[0])/(vec_s[0]**2+vec_s[1]**2)**(1/2))
         phi = np.arccos((vec_m[0])/(vec_m[0]**2+vec_m[1]**2)**(1/2))
 
         if theta - phi > fenics.DOLFIN_EPS:
             self.rotation = - self.rotation
 
-        sinus = np.round(np.sin(self.rotation), 6)
-        cosinus = np.round(np.cos(self.rotation), 6)
+        sinus = np.round(np.sin(self.rotation), 10)
+        cosinus = np.round(np.cos(self.rotation), 10)
 
         return sinus, cosinus
 
-
+    @log.profile_execution_time("implement pbc plus set zero and periodic constraints", level = log.DEBUG)
     def _implement_pbc_scalarfield(
             self, dofs_m: list[int], dofs_s: list[int], int_matrix: np.NDArray[float]
         ) -> None:
@@ -1152,7 +1163,7 @@ class PeriodicBoundaryInterpolator:
             int_matrix: The interpolation matrix between the main and the secondary side
 
         '''
-        if self.tensor_type == fenics.PETScMatrix:
+        if self.tensor_type == fenics.PETScMatrix or self.tensor_type == PETSc.Mat:
             self.matrix_scipy[:,dofs_m] += self.matrix_scipy[:,dofs_s] @ int_matrix
             self.matrix_scipy[dofs_m,:] += int_matrix.T @ self.matrix_scipy[dofs_s,:]
             self._set_zeros(dofs_s)
@@ -1164,7 +1175,7 @@ class PeriodicBoundaryInterpolator:
 
             self._set_zeros(dofs_s)
 
-
+    @log.profile_execution_time("implement pbc plus set zero and periodic constraints", level = log.DEBUG)
     def _implement_pbc_vectorfield(
             self, dofs_m_x: list[int], dofs_s_x: list[int], dofs_m_y: list[int], dofs_s_y: list[int], int_matrix: np.NDArray[float]
         ) -> None:
@@ -1181,7 +1192,7 @@ class PeriodicBoundaryInterpolator:
         '''
         sinus, cosinus = self._calculate_rotation(dofs_m_x, dofs_s_x)
 
-        if self.tensor_type == fenics.PETScMatrix:
+        if self.tensor_type == fenics.PETScMatrix or self.tensor_type == PETSc.Mat:
             self._copy_rows(dofs_m_x, dofs_m_y, dofs_s_x, dofs_s_y, sinus, cosinus, int_matrix)
 
             self._set_zeros(dofs_s_x)
@@ -1191,8 +1202,8 @@ class PeriodicBoundaryInterpolator:
             self._set_periodic_constraints(dofs_m_y, dofs_m_x, dofs_s_y, -sinus, cosinus, int_matrix)
 
         elif self.tensor_type == fenics.PETScVector:
-            self.vector[dofs_m_x] += int_matrix.T @ self.vector[dofs_s_x] * cosinus + int_matrix.T @ self.vector[dofs_s_y]  * sinus
-            self.vector[dofs_m_y] += int_matrix.T @ self.vector[dofs_s_y]  * cosinus - int_matrix.T @ self.vector[dofs_s_x] * sinus
+            self.vector[dofs_m_x] += int_matrix.T @ (self.vector[dofs_s_x] * cosinus + self.vector[dofs_s_y]  * sinus)
+            self.vector[dofs_m_y] += int_matrix.T @ (self.vector[dofs_s_y]  * cosinus - self.vector[dofs_s_x] * sinus)
             self._set_zeros(dofs_s_x)
             self._set_zeros(dofs_s_y)
 
@@ -1213,7 +1224,14 @@ class PeriodicBoundaryInterpolator:
 
         if self.tensor_type == fenics.PETScMatrix:
             self.matrix = fenics.as_backend_type(tensor).mat()
+            self.matrix_scipy = self.matrix
             self.matrix_scipy = csr_matrix(self.matrix.getValuesCSR()[::-1],shape=self.matrix.size)
+            self.matrix_scipy = self.matrix_scipy.tolil()
+
+        elif self.tensor_type == PETSc.Mat:
+            self.matrix = tensor
+            self.matrix_scipy = csr_matrix(self.matrix.getValuesCSR()[::-1],shape=self.matrix.size)
+            self.matrix_scipy = self.matrix_scipy.tolil()
         
         elif self.tensor_type == fenics.PETScVector:
             self.vector = fenics.as_backend_type(tensor).vec()
@@ -1290,8 +1308,8 @@ class PeriodicBoundaryInterpolator:
         
                     subspace_counter += 2
         
-        if self.tensor_type == fenics.PETScMatrix:
-            self.matrix = scipy2petsc(self.matrix_scipy, self.mesh.mpi_comm())
+        if self.tensor_type == fenics.PETScMatrix or self.tensor_type == PETSc.Mat:
+            self.matrix = scipy2petsc(self.matrix_scipy.tocsr(), self.mesh.mpi_comm())
             A_wrap = fenics.PETScMatrix(self.matrix)
             A = fenics.as_backend_type(A_wrap).mat()
             return A

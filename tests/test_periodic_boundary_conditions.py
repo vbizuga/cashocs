@@ -342,3 +342,50 @@ def test_circle_obture_angle():
 
     error = np.linalg.norm(coord_top_np-coord_bottom_np)
     assert error < 5
+
+def test_optimal_control():
+    config = cashocs.load_config("config_pbc.ini")
+    mesh, subdomains, boundaries, dx, ds, dS = cashocs.regular_mesh(25)
+
+    V = FunctionSpace(mesh, "CG", 1)
+
+    y = Function(V)
+    p = Function(V)
+    u = Function(V)
+    e = inner(grad(y), grad(p)) * dx - u * p * dx
+
+    class PeriodicBoundary(SubDomain):
+
+        def map(self, x, y):
+            y[0] = x[0] - 1
+            y[1] = x[1]
+            return y
+
+    periodicboundary = PeriodicBoundary()
+    dbc = cashocs.create_dirichlet_bcs(V, Constant(0), boundaries, [3, 4])
+    pbc = cashocs.create_periodic_bcs(V, boundaries, [1, 2], periodicboundary)
+
+    bc =  dbc + pbc
+    y_d = Expression("exp(-(pow(x[0]-0.9,2)+pow(x[1]-0.5,2))/0.05)",degree=1)
+    alpha = 1e-6
+    J = cashocs.IntegralFunctional(
+        Constant(0.5) * (y - y_d) * (y - y_d) * dx + Constant(0.5 * alpha) * u * u * dx
+    )
+
+    ocp = cashocs.OptimalControlProblem(e, bc, J, y, u, p, config=config, control_bcs_list=pbc)
+    ocp.solve(max_iter=100)
+
+    x_ref = np.linspace(0, 1, num=50)
+    coord_top = []
+    coord_bottom = []
+
+    for x in x_ref:
+        value_m = u((x, 1))
+        coord_top.append(value_m)
+        value_s = u((x, 0))
+        coord_bottom.append(value_s)
+    coord_top_np = np.array(coord_top)
+    coord_bottom_np = np.array(coord_bottom)
+
+    error = np.linalg.norm(coord_top_np-coord_bottom_np)
+    assert error < 5

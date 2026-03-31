@@ -93,8 +93,7 @@ class ShapeOptimizationProblem(optimization_problem.OptimizationProblem):
         gradient_ksp_options: _typing.KspOption | list[_typing.KspOption] | None = None,
         desired_weights: list[float] | None = None,
         shape_bcs_list: (
-            list[list[fenics.DirichletBC | _utils.PeriodicBC]]
-            | list[fenics.DirichletBC | _utils.PeriodicBC]
+            list[fenics.DirichletBC | _utils.PeriodicBC]
             | fenics.DirichletBC | _utils.PeriodicBC
             | None
         ) = None,

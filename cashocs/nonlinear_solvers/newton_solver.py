@@ -45,7 +45,7 @@ class _NewtonSolver:
         self,
         nonlinear_form: ufl.Form,
         u: fenics.Function,
-        bcs: fenics.DirichletBC | list[fenics.DirichletBC],
+        bcs: fenics.DirichletBC | _utils.PeriodicBC | list[fenics.DirichletBC | _utils.PeriodicBC],
         derivative: ufl.Form | None = None,
         shift: ufl.Form | None = None,
         rtol: float = 1e-10,
@@ -158,14 +158,39 @@ class _NewtonSolver:
         self.gamma = 0.9
         self.lmbd = 1.0
 
+        if type(bcs) == list:
+            self.dbcs = [bc for bc in bcs if type(bc) != _utils.PeriodicBC]
+            self.pbcs = [bc for bc in bcs if type(bc) == _utils.PeriodicBC]
+        elif type(bcs) == fenics.DirichletBC:
+            self.dbcs = [bcs]
+            self.pbcs = []
+        elif type(bcs) == _utils.PeriodicBC:
+            self.dbcs = []
+            self.pbcs = [bcs]
+        
+        boundaries = self.pbcs[0].boundaries
+        periodic_tags = list([self.pbcs[0].main_idc, self.pbcs[0].secondary_idc])
+        if self.function_space.num_sub_spaces() == 0:
+            zero_vec = np.zeros(self.function_space.ufl_element().degree())
+        else:
+            dim = 0
+            for subspace_index in range(self.function_space.num_sub_spaces()):
+                if self.function_space.sub(subspace_index).num_sub_spaces() == 0:
+                    dim += 1
+                else:
+                    dim += self.function_space.sub(subspace_index).num_sub_spaces()
+        zero_vec = np.zeros(dim)
+
+        self.artificial_bcs_periodic = _utils.create_dirichlet_bcs(self.function_space, zero_vec, boundaries, periodic_tags)
+
         self.assembler = fenics.SystemAssembler(
-            self.derivative, self.nonlinear_form, self.bcs
+            self.derivative, self.nonlinear_form, self.dbcs
         )
         self.assembler.keep_diagonal = True
 
         if self.preconditioner_form is not None:
             self.assembler_pc = fenics.SystemAssembler(
-                self.preconditioner_form, self.nonlinear_form, self.bcs
+                self.preconditioner_form, self.nonlinear_form, self.dbcs
             )
             self.assembler_pc.keep_diagonal = True
 
@@ -246,6 +271,11 @@ class _NewtonSolver:
         self.assembler.assemble(self.A_fenics)
         self.A_fenics.ident_zeros()
         self.A_matrix = self.A_fenics.mat()
+
+        for pbc in self.pbcs:
+            PBI = _utils.PeriodicBoundaryInterpolator(pbc)
+            self.A_matrix = PBI.apply_periodic_bcs(self.A_matrix)
+            self.b = PBI.apply_periodic_bcs(self.residual)
 
         if self.preconditioner_form is not None:
             self.assembler_pc.assemble(self.P_fenics)
@@ -402,6 +432,9 @@ class _NewtonSolver:
     def _compute_residual(self) -> None:
         """Computes the residual of the nonlinear system."""
         self.assembler.assemble(self.residual, self.u.vector())
+
+        for bc in self.artificial_bcs_periodic:
+            bc.apply(self.residual)
         if (
             self.shift is not None
             and self.assembler_shift is not None
@@ -465,7 +498,7 @@ class _NewtonSolver:
 def newton_solve(
     nonlinear_form: ufl.Form,
     u: fenics.Function,
-    bcs: fenics.DirichletBC | list[fenics.DirichletBC],
+    bcs: fenics.DirichletBC | _utils.PeriodicBC | list[fenics.DirichletBC | _utils.PeriodicBC],
     derivative: ufl.Form | None = None,
     shift: ufl.Form | None = None,
     rtol: float = 1e-10,
