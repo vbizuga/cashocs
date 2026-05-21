@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING
 
 import fenics
 import numpy as np
+from cashocs._utils.linalg import PeriodicBoundaryInterpolator2
 
 try:
     import ufl_legacy as ufl
@@ -70,7 +71,20 @@ def linear_solve(
     )[0]
     rhs_form = -ufl.replace(linear_form, {u: fenics.Constant(np.zeros(u.ufl_shape))})
 
-    assembler = fenics.SystemAssembler(lhs_form, rhs_form, bcs)
+    if isinstance(bcs, list):
+        dbcs = [bc for bc in bcs if type(bc) != _utils.PeriodicBC]
+        pbcs = [bc for bc in bcs if type(bc) == _utils.PeriodicBC]
+    elif isinstance(bcs, fenics.DirichletBC):
+        dbcs = [bcs]
+        pbcs = []
+    elif isinstance(bcs, _utils.PeriodicBC):
+        dbcs = []
+        pbcs = [bcs]
+    else:
+        dbcs = bcs
+        pbcs = []
+    
+    assembler = fenics.SystemAssembler(lhs_form, rhs_form, dbcs)
     assembler.keep_diagonal = True
 
     comm = u.function_space().mesh().mpi_comm()
@@ -89,15 +103,23 @@ def linear_solve(
             preconditioner_form = fenics.derivative(preconditioner_form, u)
 
         P_fenics = fenics.PETScMatrix(comm)  # pylint: disable=invalid-name
-        assembler_p = fenics.SystemAssembler(preconditioner_form, rhs_form, bcs)
+        assembler_p = fenics.SystemAssembler(preconditioner_form, rhs_form, dbcs)
         assembler_p.keep_diagonal = True
 
         assembler_p.assemble(P_fenics)
         P_matrix = fenics.as_backend_type(  # pylint: disable=invalid-name
             P_fenics
         ).mat()
+        for pbc in pbcs:
+            PBI = _utils.PeriodicBoundaryInterpolator(pbc)
+            P_matrix = PBI.apply_periodic_bcs(P_matrix)
     else:
         P_matrix = None  # pylint: disable=invalid-name
+
+    for pbc in pbcs:
+        PBI = _utils.PeriodicBoundaryInterpolator(pbc)
+        A_matrix = PBI.apply_periodic_bcs(A_fenics)
+        b = PBI.apply_periodic_bcs(b_fenics)
 
     if linear_solver is None:
         linear_solver = _utils.linalg.LinearSolver()
