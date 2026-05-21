@@ -23,7 +23,6 @@ from typing import TYPE_CHECKING
 
 import fenics
 import numpy as np
-from cashocs._utils.linalg import PeriodicBoundaryInterpolator2
 
 try:
     import ufl_legacy as ufl
@@ -72,8 +71,8 @@ def linear_solve(
     rhs_form = -ufl.replace(linear_form, {u: fenics.Constant(np.zeros(u.ufl_shape))})
 
     if isinstance(bcs, list):
-        dbcs = [bc for bc in bcs if type(bc) != _utils.PeriodicBC]
-        pbcs = [bc for bc in bcs if type(bc) == _utils.PeriodicBC]
+        dbcs = [bc for bc in bcs if not isinstance(bc, _utils.PeriodicBC)]
+        pbcs = [bc for bc in bcs if isinstance(bc, _utils.PeriodicBC)]
     elif isinstance(bcs, fenics.DirichletBC):
         dbcs = [bcs]
         pbcs = []
