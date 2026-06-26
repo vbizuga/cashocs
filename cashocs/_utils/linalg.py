@@ -855,6 +855,7 @@ class PeriodicBoundaryInterpolator:
         FiniteElement,
         VectorElement,
         MixedElement of FiniteElement or VectorElement.
+        Not properly matching meshes may result in numerical errors and oscillations.
 
     """
     def __init__(
@@ -878,6 +879,288 @@ class PeriodicBoundaryInterpolator:
 
         self.rotation: float = None
 
+    def _locate_dofs(
+            self
+        ) -> list[list[int]]:
+        '''Provides the indices of the dofs on the main and the secondary side.
+
+        Returns: 
+            sorted_indices: a sorted and structured list of the indices of the main and secondary side
+
+        '''
+        sorted_indices = []
+        noslipx = fenics.Constant((-1.0, 0.0))
+        noslipy = fenics.Constant((0.0, -1.0))
+        noslip = fenics.Constant(-1.0)
+        aux_bcs = []
+        
+        if self.functionspace.num_sub_spaces() == 0:
+            aux_bcs += forms_module.create_dirichlet_bcs(self.functionspace, noslip, self.boundaries, self.tag_main)
+            aux_bcs += forms_module.create_dirichlet_bcs(self.functionspace, noslip, self.boundaries, self.tag_secondary)
+
+        elif isinstance(self.functionspace.ufl_element(), fenics.VectorElement):
+            aux_bcs += forms_module.create_dirichlet_bcs(self.functionspace, noslipx, self.boundaries, self.tag_main)
+            aux_bcs += forms_module.create_dirichlet_bcs(self.functionspace, noslipx, self.boundaries, self.tag_secondary)
+            aux_bcs += forms_module.create_dirichlet_bcs(self.functionspace, noslipy, self.boundaries, self.tag_main)
+            aux_bcs += forms_module.create_dirichlet_bcs(self.functionspace, noslipy, self.boundaries, self.tag_secondary)
+
+        elif isinstance(self.functionspace.ufl_element(), fenics.MixedElement):
+            for subspace_index in range(self.functionspace.num_sub_spaces()):
+                if self.functionspace.sub(subspace_index).num_sub_spaces() == 0:
+                    aux_bcs += forms_module.create_dirichlet_bcs(self.functionspace.sub(subspace_index), noslip, self.boundaries, self.tag_main)
+                    aux_bcs += forms_module.create_dirichlet_bcs(self.functionspace.sub(subspace_index), noslip, self.boundaries, self.tag_secondary)
+                elif isinstance(self.functionspace.sub(subspace_index).ufl_element(), fenics.VectorElement):
+                    aux_bcs += forms_module.create_dirichlet_bcs(self.functionspace.sub(subspace_index), noslipx, self.boundaries, self.tag_main)
+                    aux_bcs += forms_module.create_dirichlet_bcs(self.functionspace.sub(subspace_index), noslipx, self.boundaries, self.tag_secondary)
+                    aux_bcs += forms_module.create_dirichlet_bcs(self.functionspace.sub(subspace_index), noslipy, self.boundaries, self.tag_main)
+                    aux_bcs += forms_module.create_dirichlet_bcs(self.functionspace.sub(subspace_index), noslipy, self.boundaries, self.tag_secondary)
+                else:
+                    raise RuntimeError("subspace dimension not fitting")
+                
+        else:
+            raise RuntimeError("function spaces not fitting")
+
+        coords_x = self.dof_coord[:, 0]
+        coords_y = self.dof_coord[:, 1]
+
+        for i, bc in enumerate(aux_bcs):
+            bv = bc.get_boundary_values()
+            structured_indices = np.fromiter(
+            (dof for dof, val in bv.items() if abs(val + 1.0) < fenics.DOLFIN_EPS_LARGE),
+            dtype=np.int32)
+
+            if i % 2 == 0:
+                dist_sq = coords_x[structured_indices]**2 + coords_y[structured_indices]**2
+                sorted_indices.append(structured_indices[np.argsort(dist_sq)])
+            else:
+                ref = [0, 0]
+                ref = self.constrained_domain.map(ref, self.dof_coord[sorted_indices[i - 1]][0, :])
+                dist_sq = (ref[0] - coords_x[structured_indices])**2 + (ref[1] - coords_y[structured_indices])**2
+                sorted_indices.append(structured_indices[np.argsort(dist_sq)])
+
+        return sorted_indices
+
+    def _calculate_rotation(
+            self, main: list[int], secondary: list[int]
+        ) -> tuple[float]:
+        '''Calculates the sinus and cosinus of the angle between the main and the secondary side
+        
+        Args:   
+            main: the dofs on the main side
+            secondary: the dofs on the secondary side
+
+        Returns:
+            sinus, cosinus: a tuple of the trigonometric functions of the angle
+
+        '''
+        vec_m = [self.dof_coord[main[0]][0]-self.dof_coord[main[-1]][0],self.dof_coord[main[0]][1]-self.dof_coord[main[-1]][1]]
+        vec_s = [self.dof_coord[secondary[0]][0]-self.dof_coord[secondary[-1]][0],self.dof_coord[secondary[0]][1]-self.dof_coord[secondary[-1]][1]]
+        
+        self.rotation = np.arccos((vec_m[0]*vec_s[0]+vec_m[1]*vec_s[1])/(vec_m[0]**2+vec_m[1]**2)**(1/2)/(vec_s[0]**2+vec_s[1]**2)**(1/2))
+        theta = np.arccos((vec_s[0])/(vec_s[0]**2+vec_s[1]**2)**(1/2))
+        phi = np.arccos((vec_m[0])/(vec_m[0]**2+vec_m[1]**2)**(1/2))
+
+        if theta - phi > fenics.DOLFIN_EPS:
+            self.rotation = - self.rotation
+
+        sinus = np.round(np.sin(self.rotation), 10)
+        cosinus = np.round(np.cos(self.rotation), 10)
+
+        return sinus, cosinus
+
+    def _create_transformation_matrix(
+            self,
+            n_dofs,
+            main_0: list[int], 
+            main_1: list[int], 
+            secondary_0: list[int], 
+            secondary_1: list[int], 
+            sinus: float, 
+            cosinus: float,
+            int_matrix: np.NDArray[float]
+        ) -> None:
+        ''' 
+        Returns a matrix that modifies the rows and columns of the matrix it is multiplied with such that periodic boundary conditions can be implemented. Secondary rows and columns are copied onto the corresponding main rows using the given interpolation matrix and are then zeroed out.
+        
+        Args:
+            main_0, main_1: the dofs on the main side, respectively the x- and y-value
+            secondary_0, secondray_1: the dofs on the secondary side, respectively the x- and y-value
+            sinus, cosinus: the trigonometric function of the angle between the main and secondary side
+            int_matrix: The interpolation matrix between the main and the secondary side
+        '''
+
+        s = len(secondary_0)
+        m = len(main_0)
+        
+        T = sparse.eye(n_dofs, format='lil')
+        
+        for idx in np.concatenate([secondary_0, secondary_1]).astype(int):
+            T[idx, idx] = 0.0
+        
+        if self.dim == 0:
+            blocks = [
+                (secondary_0, main_0,  cosinus * int_matrix),
+            ]
+        
+        else:
+            blocks = [
+                (secondary_0, main_0,  cosinus * int_matrix),
+                (secondary_0, main_1,  -sinus * int_matrix),
+                (secondary_1, main_0, sinus * int_matrix),
+                (secondary_1, main_1,  cosinus * int_matrix),
+            ]
+        
+        rows, cols, data = [], [], []
+        for sec, main, values in blocks:
+            r = np.repeat(sec, m)
+            c = np.tile(main, s)
+            rows.append(r)
+            cols.append(c)
+            if isinstance(values, csr_matrix):
+                data.append(values.toarray().ravel())
+            else:
+
+                data.append(values.ravel())
+        
+        coupling = sparse.coo_matrix((np.concatenate(data),
+                            (np.concatenate(rows), np.concatenate(cols))),
+                            shape=(n_dofs, n_dofs))
+        
+        T = T.tocsc() + coupling.tocsc()
+        return T
+
+    def _build_constraint_rows(
+            self,
+            n_dofs,
+            main_0: list[int], 
+            main_1: list[int], 
+            secondary_0: list[int], 
+            secondary_1: list[int], 
+            sinus: float, 
+            cosinus: float,
+            int_matrix: np.NDArray[float]
+        ) -> None:
+        """
+        Returns a Matrix that contains the constraint for mapping the secondary dofs to the main dofs.
+
+        Constraint: u_sec - R * int_matrix * u_main = 0
+        
+        Row sec_0:  1*u_sec0 - cos*int*u_main0 - sin*int*u_main1 = 0
+        Row sec_1:  1*u_sec1 + sin*int*u_main0 - cos*int*u_main1 = 0
+        """
+        s = len(secondary_0)
+        m = len(main_0)
+        
+        rows, cols, data = [], [], []
+        rows.append(secondary_0)
+        cols.append(secondary_0)
+        data.append(np.ones(s))
+
+        if self.dim == 0:
+            constraint_blocks = [
+                (secondary_0, main_0, -cosinus * int_matrix),
+            ]
+        else:
+            rows.append(secondary_1)
+            cols.append(secondary_1)
+            data.append(np.ones(s))
+            constraint_blocks = [
+                (secondary_0, main_0, -cosinus * int_matrix),
+                (secondary_0, main_1, sinus * int_matrix),
+                (secondary_1, main_0,  -sinus * int_matrix),
+                (secondary_1, main_1, -cosinus * int_matrix),
+            ]
+        
+        for sec, main, values in constraint_blocks:
+            r = np.repeat(sec, m)
+            c = np.tile(main, s)
+            rows.append(r)
+            cols.append(c)
+            if isinstance(values, csr_matrix):
+                data.append(values.toarray().ravel())
+            else:
+
+                data.append(values.ravel())
+        
+        C = sparse.coo_matrix((np.concatenate(data),
+                        (np.concatenate(rows), np.concatenate(cols))),
+                    shape=(n_dofs, n_dofs))
+        return C.tocsc()
+
+    def _implement_pbc_scalarfield(
+            self, dofs_m: list[int], dofs_s: list[int], int_matrix: np.NDArray[float]
+        ) -> None:
+        '''Changes the rows and columns of a Matrix or a Vector in the corresponding rows and columms
+        for a scalarfunction
+        
+        Args:
+            dofs_m: The dofs on the main side
+            dofs_s: The dofs on the secondary side
+            int_matrix: The interpolation matrix between the main and the secondary side
+
+        '''
+        sinus, cosinus = 0, 1
+        T = self._create_transformation_matrix(self.matrix_scipy.shape[0], dofs_m, np.array([]), dofs_s, np.array([]), sinus, cosinus, int_matrix)
+        C = self._build_constraint_rows(self.matrix_scipy.shape[0], dofs_m, [], dofs_s, [], sinus, cosinus, int_matrix)
+
+        if isinstance(self.tensor, (fenics.PETScMatrix, PETSc.Mat)):
+            K_mod = T.T @ self.matrix_scipy
+            self.matrix_scipy = K_mod + C
+
+        elif isinstance(self.tensor, (fenics.PETScVector, fenics.PETScVector)):
+            self.vector = T.T @ self.vector
+            self.vector[dofs_s] = 0.0
+
+    def _implement_pbc_vectorfield(
+            self, dofs_m_x: list[int], dofs_s_x: list[int], dofs_m_y: list[int], dofs_s_y: list[int], int_matrix: np.NDArray[float]
+        ) -> None:
+        '''Changes the rows and columns of a Matrix or a Vector in the corresponding rows and columms
+        for a vectorfunction
+        
+        Args:
+            dofs_m_x: The dofs on the main side, specfically the x-value of the vector
+            dofs_s_x: The dofs on the secondary side, specfically the x-value of the vector
+            dofs_m_y: The dofs on the main side, specfically the y-value of the vector
+            dofs_s_y: The dofs on the secondary side, specfically the y-value of the vector
+            int_matrix: The interpolation matrix between the main and the secondary side
+
+        '''
+        sinus, cosinus = self._calculate_rotation(dofs_m_x, dofs_s_x)
+        T = self._create_transformation_matrix(self.matrix_scipy.shape[0], dofs_m_x, dofs_m_y, dofs_s_x, dofs_s_y, sinus, cosinus, int_matrix)
+        C = self._build_constraint_rows(self.matrix_scipy.shape[0], dofs_m_x, dofs_m_y, dofs_s_x, dofs_s_y, sinus, cosinus, int_matrix)
+
+        if isinstance(self.tensor, (fenics.PETScMatrix, PETSc.Mat)):
+            K_mod = T.T @ self.matrix_scipy
+            self.matrix_scipy = K_mod + C
+
+        elif isinstance(self.tensor, (fenics.PETScVector, fenics.PETScVector)):
+            self.vector = T.T @ self.vector
+            self.vector[dofs_s_x] = 0.0
+            self.vector[dofs_s_y] = 0.0
+
+    def _get_dof_distances(
+            self, counter: int
+            ) -> tuple[list[list[int]], list[list[int]]]:
+        '''Returns the relative coordinates of the dofs in anscending order.
+        
+        Args:
+            counter: number of the current subspace
+
+        Returns:
+            rel_dof_distances: an ordered list of the coordinates of the dofs
+
+        '''
+        rel_dof_distances = [[0],[0]]
+
+        for i in range(2):
+            for index, dof in enumerate(self.sorted_indices[2*counter+i]):
+                if index < len(self.sorted_indices[2*counter+i])-1:
+                    rel_dof_distances[i] += [((self.dof_coord[dof][1] - self.dof_coord[self.sorted_indices[2*counter+i][index+1]][1])**2
+                                                    +(self.dof_coord[dof][0] - self.dof_coord[self.sorted_indices[2*counter+i][index+1]][0])**2)**(1/2) 
+                                                    + rel_dof_distances[i][index]]
+            
+        return rel_dof_distances
+
     def _create_interpolation_matrix(
         self,
         dst: list[float], 
@@ -895,11 +1178,17 @@ class PeriodicBoundaryInterpolator:
             The resulting Numpy Interpolation Matrix
 
         """
-        
         n_src = len(src)
         n_dst = len(dst)
         src = np.array(src)
         dst = np.array(dst)
+
+        vertex_coords = self.mesh.coordinates()
+        vtx_tree = cKDTree(vertex_coords)
+        dists, _ = vtx_tree.query(self.dof_coord[:, 0])
+
+        is_midpoint = dists > 1e-10
+        midpoint_coords = self.dof_coord[:, 0][is_midpoint]
 
         if degree == 'linear' or degree == 1:
             interpolation_matrix = np.zeros((n_dst, n_src))
@@ -934,259 +1223,11 @@ class PeriodicBoundaryInterpolator:
             col_indices = ravelled_indices.ravel()
             weights     = np.column_stack([w0, w1, w2]).ravel()
 
-            M = csr_matrix((weights, (row_indices, col_indices)), shape=(n_dst, n_src)).T
+            M = csr_matrix((weights, (row_indices, col_indices)), shape=(n_dst, n_src))
             return M
 
         else:
             raise RuntimeError("No Interpolation possible")
-
-    @log.profile_execution_time("locating dofs", level = log.DEBUG)
-    def _locate_dofs(
-            self
-        ) -> list[list[int]]:
-        '''Provides the indices of the dofs on the main and the secondary side.
-
-        Returns: 
-            sorted_indices: a sorted and structured list of the indices of the main and secondary side
-
-        '''
-        sorted_indices = []
-        noslipx = fenics.Constant((-5.0, 0.0))
-        noslipy = fenics.Constant((0.0, -5.0))
-        noslip = fenics.Constant(-5.0)
-        aux_bcs = []
-        
-        if self.functionspace.num_sub_spaces() == 0:
-            aux_bcs += forms_module.create_dirichlet_bcs(self.functionspace, noslip, self.boundaries, self.tag_main)
-            aux_bcs += forms_module.create_dirichlet_bcs(self.functionspace, noslip, self.boundaries, self.tag_secondary)
-
-        elif isinstance(self.functionspace.ufl_element(), fenics.VectorElement):
-            aux_bcs += forms_module.create_dirichlet_bcs(self.functionspace, noslipx, self.boundaries, self.tag_main)
-            aux_bcs += forms_module.create_dirichlet_bcs(self.functionspace, noslipx, self.boundaries, self.tag_secondary)
-            aux_bcs += forms_module.create_dirichlet_bcs(self.functionspace, noslipy, self.boundaries, self.tag_main)
-            aux_bcs += forms_module.create_dirichlet_bcs(self.functionspace, noslipy, self.boundaries, self.tag_secondary)
-
-        elif isinstance(self.functionspace.ufl_element(), fenics.MixedElement):
-            for subspace_index in range(self.functionspace.num_sub_spaces()):
-                if self.functionspace.sub(subspace_index).num_sub_spaces() == 0:
-                    aux_bcs += forms_module.create_dirichlet_bcs(self.functionspace.sub(subspace_index), noslip, self.boundaries, self.tag_main)
-                    aux_bcs += forms_module.create_dirichlet_bcs(self.functionspace.sub(subspace_index), noslip, self.boundaries, self.tag_secondary)
-                elif isinstance(self.functionspace.sub(subspace_index).ufl_element(), fenics.VectorElement):
-                    aux_bcs += forms_module.create_dirichlet_bcs(self.functionspace.sub(subspace_index), noslipx, self.boundaries, self.tag_main)
-                    aux_bcs += forms_module.create_dirichlet_bcs(self.functionspace.sub(subspace_index), noslipx, self.boundaries, self.tag_secondary)
-                    aux_bcs += forms_module.create_dirichlet_bcs(self.functionspace.sub(subspace_index), noslipy, self.boundaries, self.tag_main)
-                    aux_bcs += forms_module.create_dirichlet_bcs(self.functionspace.sub(subspace_index), noslipy, self.boundaries, self.tag_secondary)
-                else:
-                    raise RuntimeError("subspace dimension not fitting")
-                
-        else:
-            raise RuntimeError("function spaces not fitting")
-
-        for i, bc in enumerate(aux_bcs):
-            t = fenics.Function(self.functionspace)
-            tv = t.vector()
-            bc.apply(tv)
-            structured_indices = np.where(abs(np.array(tv)+5.0) < fenics.DOLFIN_EPS_LARGE)[0]
-            if i%2 == 0:
-                sorted_indices += [
-                    structured_indices[np.argsort(self.dof_coord[:,1][structured_indices]
-                                                +self.dof_coord[:,0][structured_indices])].astype('int32')]
-            elif i%2 == 1:
-                reference_dof = [0,0]
-                reference_dof = self.constrained_domain.map(reference_dof, self.dof_coord[sorted_indices[i-1]][0,:])
-                sorted_indices += [
-                    structured_indices[np.argsort(abs(reference_dof[1]
-                                                -self.dof_coord[:,1][structured_indices])**2
-                                                +abs(reference_dof[0]
-                                                -self.dof_coord[:,0][structured_indices])**2)].astype('int32')]
-                
-        return sorted_indices
-
-    @log.profile_execution_time("splitting dof coordinates", level = log.DEBUG)
-    def _get_dof_distances(
-            self, counter: int
-            ) -> tuple[list[list[int]], list[list[int]]]:
-        '''Returns the relative coordinates of the dofs in anscending order.
-        
-        Args:
-            counter: number of the current subspace
-
-        Returns:
-            rel_dof_distances: an ordered list of the coordinates of the dofs
-
-        '''
-        rel_dof_distances = [[0],[0]]
-
-        for i in range(2):
-            for index, dof in enumerate(self.sorted_indices[2*counter+i]):
-                if index < len(self.sorted_indices[2*counter+i])-1:
-                    rel_dof_distances[i] += [((self.dof_coord[dof][1] - self.dof_coord[self.sorted_indices[2*counter+i][index+1]][1])**2
-                                                    +(self.dof_coord[dof][0] - self.dof_coord[self.sorted_indices[2*counter+i][index+1]][0])**2)**(1/2) 
-                                                    + rel_dof_distances[i][index]]
-            
-        return rel_dof_distances
-
-    @log.profile_execution_time("copy rows", level = log.DEBUG)
-    def _copy_rows(
-            self, 
-            main_0: list[int], 
-            main_1: list[int], 
-            secondary_0: list[int], 
-            secondary_1: list[int], 
-            sinus: float, 
-            cosinus: float,
-            int_matrix: np.NDArray[float]
-        ) -> None:
-        ''' Copies the rows of the secondary side to the corresponding rows on the main side respecting rotation and interpolation
-        
-        Args:
-            main_0, main_1: the dofs on the main side, respectively the x- and y-value
-            secondary_0, secondray_1: the dofs on the secondary side, respectively the x- and y-value
-            sinus, cosinus: the trigonometric function of the angle between the main and secondary side
-            int_matrix: The interpolation matrix between the main and the secondary side
-
-        '''
-        self.matrix_scipy[:,main_0] += (int_matrix @ (self.matrix_scipy[:,secondary_0] * cosinus + self.matrix_scipy[:,secondary_1] * sinus).T).T
-        self.matrix_scipy[main_0,:] += (int_matrix @ (self.matrix_scipy[secondary_0,:] * cosinus + self.matrix_scipy[secondary_1,:] * sinus))
-        self.matrix_scipy[:,main_1] += (int_matrix @ (self.matrix_scipy[:,secondary_1] * cosinus - self.matrix_scipy[:,secondary_0] * sinus).T).T
-        self.matrix_scipy[main_1,:] += (int_matrix @ (self.matrix_scipy[secondary_1,:] * cosinus - self.matrix_scipy[secondary_0,:] * sinus))
-
-    @log.profile_execution_time("set rows to zero", level = log.DEBUG)
-    def _set_zeros(
-            self, secondary: list[int]
-        ) -> None:
-        '''Sets all values of the matrix or vector for given indices of a row and column to zero
-        
-        Args:
-            secondary: a list of indices
-
-        '''
-        if isinstance(self.tensor, (fenics.PETScMatrix, PETSc.Mat)):
-            secondary_set = set(secondary)
-            for i in range(self.matrix_scipy.shape[0]):
-                keep = [j for j, col in enumerate(self.matrix_scipy.rows[i]) if col not in secondary_set]
-                self.matrix_scipy.data[i] = [self.matrix_scipy.data[i][j] for j in keep]
-                self.matrix_scipy.rows[i] = [self.matrix_scipy.rows[i][j] for j in keep]
-
-            for idx in secondary:
-                self.matrix_scipy.data[idx] = []
-                self.matrix_scipy.rows[idx] = []
-        
-        elif isinstance(self.tensor, (fenics.PETScVector, PETSc.Vec)):
-            for dof_s in secondary:
-                self.vector[dof_s] = 0
-
-    @log.profile_execution_time("set periodic constrains", level = log.DEBUG)
-    def _set_periodic_constraints(
-            self, 
-            main_0: list[int], 
-            main_1: list[int], 
-            secondary: list[int], 
-            sinus: float, 
-            cosinus: float, 
-            int_matrix: np.NDArray[float]
-        ) -> None:
-        ''' Sets the constrains, that every secondary dof is only determined by the corresponding main dofs
-        
-        Args:
-            main_0, main_1: the dofs on the main side, respectively the x- and y-value
-            secondary: the dofs on the secondary side, x- or y-value
-            sinus, cosinus: the trigonometric function of the angle between the main and secondary side
-            int_matrix: The interpolation matrix between the main and the secondary side
-
-        '''
-        for index_s, dof_s in enumerate(secondary):
-            self.matrix_scipy[dof_s, dof_s] = 1
-            self.matrix_scipy[dof_s, main_0] = - int_matrix[index_s,:]*cosinus
-            if not len(main_1) == 0:
-                self.matrix_scipy[dof_s, main_1] = int_matrix[index_s,:]*sinus
-
-    def _calculate_rotation(
-            self, main: list[int], secondary: list[int]
-        ) -> tuple[float]:
-        '''Calculates the sinus and cosinus of the angle between the main and the secondary side
-        
-        Args:   
-            main: the dofs on the main side
-            secondary: the dofs on the secondary side
-
-        Returns:
-            sinus, cosinus: a tuple of the trigonometric functions of the angle
-
-        '''
-        vec_m = [self.dof_coord[main[0]][0]-self.dof_coord[main[-1]][0],self.dof_coord[main[0]][1]-self.dof_coord[main[-1]][1]]
-        vec_s = [self.dof_coord[secondary[0]][0]-self.dof_coord[secondary[-1]][0],self.dof_coord[secondary[0]][1]-self.dof_coord[secondary[-1]][1]]
-        
-        self.rotation = np.arccos((vec_m[0]*vec_s[0]+vec_m[1]*vec_s[1])/(vec_m[0]**2+vec_m[1]**2)**(1/2)/(vec_s[0]**2+vec_s[1]**2)**(1/2))
-        theta = np.arccos((vec_s[0])/(vec_s[0]**2+vec_s[1]**2)**(1/2))
-        phi = np.arccos((vec_m[0])/(vec_m[0]**2+vec_m[1]**2)**(1/2))
-
-        if theta - phi > fenics.DOLFIN_EPS:
-            self.rotation = - self.rotation
-
-        sinus = np.round(np.sin(self.rotation), 10)
-        cosinus = np.round(np.cos(self.rotation), 10)
-
-        return sinus, cosinus
-
-    @log.profile_execution_time("implement pbc plus set zero and periodic constraints", level = log.DEBUG)
-    def _implement_pbc_scalarfield(
-            self, dofs_m: list[int], dofs_s: list[int], int_matrix: np.NDArray[float]
-        ) -> None:
-        '''Changes the rows and columns of a Matrix or a Vector in the corresponding rows and columms
-        for a scalarfunction
-        
-        Args:
-            dofs_m: The dofs on the main side
-            dofs_s: The dofs on the secondary side
-            int_matrix: The interpolation matrix between the main and the secondary side
-
-        '''
-        if isinstance(self.tensor, (fenics.PETScMatrix, PETSc.Mat)):
-            self.matrix_scipy[:,dofs_m] += (int_matrix @ self.matrix_scipy[:,dofs_s].T).T
-            self.matrix_scipy[dofs_m,:] += (int_matrix @ self.matrix_scipy[dofs_s,:])
-            self._set_zeros(dofs_s)
-
-            self._set_periodic_constraints(dofs_m, [], dofs_s, 0, 1, int_matrix.T)
-
-        elif isinstance(self.tensor, fenics.PETScVector):
-            self.vector[dofs_m] += int_matrix @ self.vector[dofs_s]
-
-            self._set_zeros(dofs_s)
-
-    @log.profile_execution_time("implement pbc plus set zero and periodic constraints", level = log.DEBUG)
-    def _implement_pbc_vectorfield(
-            self, dofs_m_x: list[int], dofs_s_x: list[int], dofs_m_y: list[int], dofs_s_y: list[int], int_matrix: np.NDArray[float]
-        ) -> None:
-        '''Changes the rows and columns of a Matrix or a Vector in the corresponding rows and columms
-        for a vectorfunction
-        
-        Args:
-            dofs_m_x: The dofs on the main side, specfically the x-value of the vector
-            dofs_s_x: The dofs on the secondary side, specfically the x-value of the vector
-            dofs_m_y: The dofs on the main side, specfically the y-value of the vector
-            dofs_s_y: The dofs on the secondary side, specfically the y-value of the vector
-            int_matrix: The interpolation matrix between the main and the secondary side
-
-        '''
-        sinus, cosinus = self._calculate_rotation(dofs_m_x, dofs_s_x)
-
-        if isinstance(self.tensor, (fenics.PETScMatrix, PETSc.Mat)):
-            self._copy_rows(dofs_m_x, dofs_m_y, dofs_s_x, dofs_s_y, sinus, cosinus, int_matrix)
-
-            self._set_zeros(dofs_s_x)
-            self._set_zeros(dofs_s_y)
-            
-            self._set_periodic_constraints(dofs_m_x, dofs_m_y, dofs_s_x, sinus, cosinus, int_matrix.T)
-            self._set_periodic_constraints(dofs_m_y, dofs_m_x, dofs_s_y, - sinus, cosinus, int_matrix.T)
-
-        elif isinstance(self.tensor, (fenics.PETScVector, fenics.PETScVector)):
-            s_x = self.vector[dofs_s_x].copy()
-            s_y = self.vector[dofs_s_y].copy()
-            self.vector[dofs_m_x] += int_matrix @ (s_x * cosinus - s_y * sinus)
-            self.vector[dofs_m_y] += int_matrix @ (s_y * cosinus + s_x * sinus)
-            self._set_zeros(dofs_s_x)
-            self._set_zeros(dofs_s_y)
 
     def apply_periodic_bcs(
             self, tensor: fenics.PETScMatrix | fenics.PETScVector
@@ -1198,24 +1239,23 @@ class PeriodicBoundaryInterpolator:
 
         Returns:
             The corresponding PETScMatrix or PETScVector with the applied Periodic Boundary Conditions
-            
+        
         '''
         self.tensor = tensor
 
         if isinstance(self.tensor, fenics.PETScMatrix):
             self.matrix = fenics.as_backend_type(tensor).mat()
-            self.matrix_scipy = csr_matrix(self.matrix.getValuesCSR()[::-1],shape=self.matrix.size)
-            self.matrix_scipy = self.matrix_scipy.tolil()
+            self.matrix_scipy = sparse.csc_matrix(self.matrix.getValuesCSR()[::-1],shape=self.matrix.size)
 
         elif isinstance(self.tensor, PETSc.Mat):
-            self.matrix_scipy = csr_matrix(tensor.getValuesCSR()[::-1],shape=tensor.size)
-            self.matrix_scipy = self.matrix_scipy.tolil()
+            self.matrix_scipy = sparse.csc_matrix(self.tensor.getValuesCSR()[::-1],shape=self.matrix.size)
         
         elif isinstance(self.tensor, (fenics.PETScVector, PETSc.Vec)):
             self.vector = fenics.as_backend_type(tensor).vec()
 
         if self.functionspace.num_sub_spaces() == 0:
             degree = self.functionspace.ufl_element().degree()
+            self.dim = self.functionspace.num_sub_spaces()
 
             rel_dof_distances = self._get_dof_distances(0)
 
@@ -1225,6 +1265,7 @@ class PeriodicBoundaryInterpolator:
 
         elif isinstance(self.functionspace.ufl_element(), fenics.VectorElement):
             degree = self.functionspace.ufl_element().degree()
+            self.dim = self.functionspace.num_sub_spaces()
             rel_dof_distances = self._get_dof_distances(0)
 
             int_matrix = self._create_interpolation_matrix(rel_dof_distances[1],rel_dof_distances[0],degree)
@@ -1236,13 +1277,14 @@ class PeriodicBoundaryInterpolator:
 
             for subspace_index in range(self.functionspace.num_sub_spaces()):
                 degree = self.functionspace.sub(subspace_index).ufl_element().degree()
+                self.dim = self.functionspace.sub(subspace_index).num_sub_spaces()
 
-                if self.functionspace.sub(subspace_index).num_sub_spaces() == 0:
-                    rel_dof_distances = self._get_dof_distances(subspace_counter)
+                if self.dim == 0:
+                    # rel_dof_distances = self._get_dof_distances(subspace_counter)
                     
-                    int_matrix = self._create_interpolation_matrix(rel_dof_distances[0],rel_dof_distances[1],degree)
+                    # int_matrix = self._create_interpolation_matrix(rel_dof_distances[0],rel_dof_distances[1],degree)
                     
-                    self._implement_pbc_scalarfield(self.sorted_indices[2*subspace_counter], self.sorted_indices[2*subspace_counter+1], int_matrix)
+                    # self._implement_pbc_scalarfield(self.sorted_indices[2*subspace_counter], self.sorted_indices[2*subspace_counter+1], int_matrix)
                     subspace_counter += 1
                 
                 elif isinstance(self.functionspace.sub(subspace_index).ufl_element(), fenics.VectorElement):
@@ -1259,4 +1301,6 @@ class PeriodicBoundaryInterpolator:
             return self.matrix
         
         elif isinstance(self.tensor, fenics.PETScVector):
-            return self.vector
+            self.vector_res = PETSc.Vec().createSeq(len(self.vector))
+            self.vector_res.setArray(self.vector)
+            return self.vector_res
