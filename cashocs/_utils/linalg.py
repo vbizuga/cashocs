@@ -877,8 +877,6 @@ class PeriodicBoundaryInterpolator:
         self.dof_coord = self.functionspace.tabulate_dof_coordinates()
         self.sorted_indices: list = self._locate_dofs()
 
-        self.rotation: float = None
-
     def _locate_dofs(
             self
         ) -> list[list[int]]:
@@ -898,210 +896,219 @@ class PeriodicBoundaryInterpolator:
             aux_bcs += forms_module.create_dirichlet_bcs(self.functionspace, noslip, self.boundaries, self.tag_main)
             aux_bcs += forms_module.create_dirichlet_bcs(self.functionspace, noslip, self.boundaries, self.tag_secondary)
 
-        elif isinstance(self.functionspace.ufl_element(), fenics.VectorElement):
-            aux_bcs += forms_module.create_dirichlet_bcs(self.functionspace, noslipx, self.boundaries, self.tag_main)
-            aux_bcs += forms_module.create_dirichlet_bcs(self.functionspace, noslipx, self.boundaries, self.tag_secondary)
-            aux_bcs += forms_module.create_dirichlet_bcs(self.functionspace, noslipy, self.boundaries, self.tag_main)
-            aux_bcs += forms_module.create_dirichlet_bcs(self.functionspace, noslipy, self.boundaries, self.tag_secondary)
+            bv_main = aux_bcs[0].get_boundary_values()
+            indices_main = np.fromiter((dof for dof, val in bv_main.items() if abs(val + 1.0) < fenics.DOLFIN_EPS_LARGE), dtype=np.int32)
 
-        elif isinstance(self.functionspace.ufl_element(), fenics.MixedElement):
-            for subspace_index in range(self.functionspace.num_sub_spaces()):
-                if self.functionspace.sub(subspace_index).num_sub_spaces() == 0:
-                    aux_bcs += forms_module.create_dirichlet_bcs(self.functionspace.sub(subspace_index), noslip, self.boundaries, self.tag_main)
-                    aux_bcs += forms_module.create_dirichlet_bcs(self.functionspace.sub(subspace_index), noslip, self.boundaries, self.tag_secondary)
-                elif isinstance(self.functionspace.sub(subspace_index).ufl_element(), fenics.VectorElement):
-                    aux_bcs += forms_module.create_dirichlet_bcs(self.functionspace.sub(subspace_index), noslipx, self.boundaries, self.tag_main)
-                    aux_bcs += forms_module.create_dirichlet_bcs(self.functionspace.sub(subspace_index), noslipx, self.boundaries, self.tag_secondary)
-                    aux_bcs += forms_module.create_dirichlet_bcs(self.functionspace.sub(subspace_index), noslipy, self.boundaries, self.tag_main)
-                    aux_bcs += forms_module.create_dirichlet_bcs(self.functionspace.sub(subspace_index), noslipy, self.boundaries, self.tag_secondary)
-                else:
-                    raise RuntimeError("subspace dimension not fitting")
-                
+            bv_second = aux_bcs[1].get_boundary_values()
+            indices_second = np.fromiter((dof for dof, val in bv_second.items() if abs(val + 1.0) < fenics.DOLFIN_EPS_LARGE), dtype=np.int32)
+
+            mapped_coords = self.constrained_domain.map(self.dof_coord[indices_main], np.empty_like(self.dof_coord[indices_main]))
+
+            vtx_tree_mapped = cKDTree(mapped_coords)
+            _, sec_verts_indices = vtx_tree_mapped.query(self.dof_coord[indices_second], k=2)
+
+            nearest_dofs_indices = indices_main[sec_verts_indices]
+
+            sorted_indices.append(nearest_dofs_indices)
+            sorted_indices.append(indices_second)
+
         else:
-            raise RuntimeError("function spaces not fitting")
+            if isinstance(self.functionspace.ufl_element(), fenics.VectorElement):
+                aux_bcs += forms_module.create_dirichlet_bcs(self.functionspace, noslipx, self.boundaries, self.tag_main)
+                aux_bcs += forms_module.create_dirichlet_bcs(self.functionspace, noslipx, self.boundaries, self.tag_secondary)
+                aux_bcs += forms_module.create_dirichlet_bcs(self.functionspace, noslipy, self.boundaries, self.tag_main)
+                aux_bcs += forms_module.create_dirichlet_bcs(self.functionspace, noslipy, self.boundaries, self.tag_secondary)
 
-        coords_x = self.dof_coord[:, 0]
-        coords_y = self.dof_coord[:, 1]
-
-        for i, bc in enumerate(aux_bcs):
-            bv = bc.get_boundary_values()
-            structured_indices = np.fromiter(
-            (dof for dof, val in bv.items() if abs(val + 1.0) < fenics.DOLFIN_EPS_LARGE),
-            dtype=np.int32)
-
-            if i % 2 == 0:
-                dist_sq = coords_x[structured_indices]**2 + coords_y[structured_indices]**2
-                sorted_indices.append(structured_indices[np.argsort(dist_sq)])
+            elif isinstance(self.functionspace.ufl_element(), fenics.MixedElement):
+                for subspace_index in range(self.functionspace.num_sub_spaces()):
+                    if self.functionspace.sub(subspace_index).num_sub_spaces() == 0:
+                        pass
+                    elif isinstance(self.functionspace.sub(subspace_index).ufl_element(), fenics.VectorElement):
+                        aux_bcs += forms_module.create_dirichlet_bcs(self.functionspace.sub(subspace_index), noslipx, self.boundaries, self.tag_main)
+                        aux_bcs += forms_module.create_dirichlet_bcs(self.functionspace.sub(subspace_index), noslipx, self.boundaries, self.tag_secondary)
+                        aux_bcs += forms_module.create_dirichlet_bcs(self.functionspace.sub(subspace_index), noslipy, self.boundaries, self.tag_main)
+                        aux_bcs += forms_module.create_dirichlet_bcs(self.functionspace.sub(subspace_index), noslipy, self.boundaries, self.tag_secondary)
+                    else:
+                        raise RuntimeError("subspace dimension not fitting")
+                    
             else:
-                ref = [0, 0]
-                ref = self.constrained_domain.map(ref, self.dof_coord[sorted_indices[i - 1]][0, :])
-                dist_sq = (ref[0] - coords_x[structured_indices])**2 + (ref[1] - coords_y[structured_indices])**2
-                sorted_indices.append(structured_indices[np.argsort(dist_sq)])
+                raise RuntimeError("function spaces not fitting")
+
+
+            for i, bc in enumerate(aux_bcs):
+                if i%2 == 0:
+                    if i % 4 == 0:
+                        j = 0
+                    else:
+                        j = -2
+
+                    # Main und secondary dofs aus bc extrahieren
+                    bv_main = bc.get_boundary_values()
+                    indices_main = np.fromiter((dof for dof, val in bv_main.items() if abs(val + 1.0) < fenics.DOLFIN_EPS_LARGE), dtype=np.int32)
+
+                    bv_second_x = aux_bcs[i+1+j].get_boundary_values()
+                    indices_second_x = np.fromiter((dof for dof, val in bv_second_x.items() if abs(val + 1.0) < fenics.DOLFIN_EPS_LARGE), dtype=np.int32)
+
+                    bv_second_y = aux_bcs[i+3+j].get_boundary_values()
+                    indices_second_y = np.fromiter((dof for dof, val in bv_second_y.items() if abs(val + 1.0) < fenics.DOLFIN_EPS_LARGE), dtype=np.int32)
+
+                    # Betrachte nur Mittelpunkte auf der main Seite
+                    vertex_coords = self.mesh.coordinates()
+                    vtx_tree = cKDTree(vertex_coords)
+                    dists, _ = vtx_tree.query(self.dof_coord[indices_main])
+                    is_midpoint = dists > 1e-10
+                    filtered_main = self.dof_coord[indices_main][is_midpoint]
+
+                    # Main Dofs mappen
+                    mapped_coords_filtered = self.constrained_domain.map(filtered_main, np.empty_like(filtered_main))
+
+                    # Suche nach den Mittelpunkten der Main seite, die den second dofs am nächsten sind
+                    vtx_tree_filtered = cKDTree(mapped_coords_filtered)
+                    _, sec_verts_indices_x = vtx_tree_filtered.query(self.dof_coord[indices_second_x], k=1)
+                    _, sec_verts_indices_y = vtx_tree_filtered.query(self.dof_coord[indices_second_y], k=1)
+
+                    # Suche die beiden daneben liegenden Dofs der Main seite
+                    mapped_coords = self.constrained_domain.map(self.dof_coord[indices_main], np.empty_like(self.dof_coord[indices_main]))
+                    coords_tree = cKDTree(mapped_coords)
+                    _, sec_coords_indices_x = coords_tree.query(mapped_coords_filtered[sec_verts_indices_x], k=3)
+                    _, sec_coords_indices_y = coords_tree.query(mapped_coords_filtered[sec_verts_indices_y], k=3)
+
+                    # Suche die globalen Indizes der entsprechenden Dofs
+                    nearest_dofs_indices_secx = indices_main[sec_coords_indices_x]
+                    nearest_dofs_indices_secy = indices_main[sec_coords_indices_y]
+
+                    sorted_indices.append(nearest_dofs_indices_secx)
+                    sorted_indices.append(indices_second_x)
+                    sorted_indices.append(nearest_dofs_indices_secy)
+                    sorted_indices.append(indices_second_y)
 
         return sorted_indices
 
     def _calculate_rotation(
-            self, main: list[int], secondary: list[int]
+            self
         ) -> tuple[float]:
         '''Calculates the sinus and cosinus of the angle between the main and the secondary side
         
         Args:   
-            main: the dofs on the main side
-            secondary: the dofs on the secondary side
+            none
 
         Returns:
             sinus, cosinus: a tuple of the trigonometric functions of the angle
 
         '''
-        vec_m = [self.dof_coord[main[0]][0]-self.dof_coord[main[-1]][0],self.dof_coord[main[0]][1]-self.dof_coord[main[-1]][1]]
-        vec_s = [self.dof_coord[secondary[0]][0]-self.dof_coord[secondary[-1]][0],self.dof_coord[secondary[0]][1]-self.dof_coord[secondary[-1]][1]]
-        
-        self.rotation = np.arccos((vec_m[0]*vec_s[0]+vec_m[1]*vec_s[1])/(vec_m[0]**2+vec_m[1]**2)**(1/2)/(vec_s[0]**2+vec_s[1]**2)**(1/2))
-        theta = np.arccos((vec_s[0])/(vec_s[0]**2+vec_s[1]**2)**(1/2))
-        phi = np.arccos((vec_m[0])/(vec_m[0]**2+vec_m[1]**2)**(1/2))
+        vec_1 = [1,1]
+        vec_2 = [0,0]
+        mapped_vec = self.constrained_domain.map(vec_1, vec_2)
+        rotation = np.arccos((vec_1[0]*mapped_vec[0]+vec_1[1]*mapped_vec[1])/(vec_1[0]**2+vec_1[1]**2)**(1/2)/(mapped_vec[0]**2+mapped_vec[1]**2)**(1/2))
 
-        if theta - phi > fenics.DOLFIN_EPS:
-            self.rotation = - self.rotation
-
-        sinus = np.round(np.sin(self.rotation), 10)
-        cosinus = np.round(np.cos(self.rotation), 10)
+        sinus = np.round(np.sin(rotation), 10)
+        cosinus = np.round(np.cos(rotation), 10)
 
         return sinus, cosinus
 
     def _create_transformation_matrix(
             self,
-            n_dofs,
-            main_0: list[int], 
-            main_1: list[int], 
-            secondary_0: list[int], 
-            secondary_1: list[int], 
+            subspace_counter: int,
+            degree: int,
+            vec: bool,
             sinus: float, 
-            cosinus: float,
-            int_matrix: np.NDArray[float]
+            cosinus: float
         ) -> None:
         ''' 
         Returns a matrix that modifies the rows and columns of the matrix it is multiplied with such that periodic boundary conditions can be implemented. Secondary rows and columns are copied onto the corresponding main rows using the given interpolation matrix and are then zeroed out.
         
         Args:
-            main_0, main_1: the dofs on the main side, respectively the x- and y-value
-            secondary_0, secondray_1: the dofs on the secondary side, respectively the x- and y-value
+            subspace_counter: The number of the current subspace
+            degree: linear or quadratic elements
+            vec: Bool if the functionspace is scalar or vectorvalued
             sinus, cosinus: the trigonometric function of the angle between the main and secondary side
-            int_matrix: The interpolation matrix between the main and the secondary side
         '''
-
-        s = len(secondary_0)
-        m = len(main_0)
-        
+        n_dofs = self.matrix_scipy.shape[0]
         T = sparse.eye(n_dofs, format='lil')
-        
-        for idx in np.concatenate([secondary_0, secondary_1]).astype(int):
-            T[idx, idx] = 0.0
-        
-        if self.dim == 0:
-            blocks = [
-                (secondary_0, main_0,  cosinus * int_matrix),
-            ]
-        
-        else:
-            blocks = [
-                (secondary_0, main_0,  cosinus * int_matrix),
-                (secondary_0, main_1,  -sinus * int_matrix),
-                (secondary_1, main_0, sinus * int_matrix),
-                (secondary_1, main_1,  cosinus * int_matrix),
-            ]
-        
-        rows, cols, data = [], [], []
-        for sec, main, values in blocks:
-            r = np.repeat(sec, m)
-            c = np.tile(main, s)
-            rows.append(r)
-            cols.append(c)
-            if isinstance(values, csr_matrix):
-                data.append(values.toarray().ravel())
-            else:
 
-                data.append(values.ravel())
-        
-        coupling = sparse.coo_matrix((np.concatenate(data),
-                            (np.concatenate(rows), np.concatenate(cols))),
-                            shape=(n_dofs, n_dofs))
-        
-        T = T.tocsc() + coupling.tocsc()
+        if vec:
+            for idx in np.concatenate([self.sorted_indices[subspace_counter+1], self.sorted_indices[subspace_counter+3]]).astype(int):
+                T[idx, idx] = 0.0
+
+            int_matrix_xx = cosinus * self._create_interpolation_matrix(self.sorted_indices[subspace_counter], self.sorted_indices[subspace_counter+1], degree)
+            int_matrix_xy = sinus * self._create_interpolation_matrix(self.sorted_indices[subspace_counter+2], self.sorted_indices[subspace_counter+3], degree)
+            int_matrix_yx = -sinus * self._create_interpolation_matrix(self.sorted_indices[subspace_counter+4], self.sorted_indices[subspace_counter+5], degree)
+            int_matrix_yy = cosinus * self._create_interpolation_matrix(self.sorted_indices[subspace_counter+6], self.sorted_indices[subspace_counter+7], degree)
+            
+            T += int_matrix_xx + int_matrix_xy + int_matrix_yx + int_matrix_yy
+        else:
+            for idx in self.sorted_indices[subspace_counter+1].astype(int):
+                T[idx, idx] = 0.0
+
+            int_matrix = self._create_interpolation_matrix(self.sorted_indices[subspace_counter], self.sorted_indices[subspace_counter+1], degree)
+            
+            T += int_matrix
+
+        T = T.tocsc()
+
         return T
 
     def _build_constraint_rows(
             self,
-            n_dofs,
-            main_0: list[int], 
-            main_1: list[int], 
-            secondary_0: list[int], 
-            secondary_1: list[int], 
+            subspace_counter: int,
+            degree: int,
+            vec: bool,
             sinus: float, 
-            cosinus: float,
-            int_matrix: np.NDArray[float]
+            cosinus: float
         ) -> None:
         """
         Returns a Matrix that contains the constraint for mapping the secondary dofs to the main dofs.
 
-        Constraint: u_sec - R * int_matrix * u_main = 0
-        
-        Row sec_0:  1*u_sec0 - cos*int*u_main0 - sin*int*u_main1 = 0
-        Row sec_1:  1*u_sec1 + sin*int*u_main0 - cos*int*u_main1 = 0
+        Args:
+            subspace_counter: The number of the current subspace
+            degree: linear or quadratic elements
+            vec: Bool if the functionspace is scalar or vectorvalued
+            sinus, cosinus: the trigonometric function of the angle between the main and secondary side
+
         """
-        s = len(secondary_0)
-        m = len(main_0)
+        n_dofs = self.matrix_scipy.shape[0]
+        s = len(self.sorted_indices[subspace_counter+1])
         
         rows, cols, data = [], [], []
-        rows.append(secondary_0)
-        cols.append(secondary_0)
+        rows.append(self.sorted_indices[subspace_counter+1])
+        cols.append(self.sorted_indices[subspace_counter+1])
         data.append(np.ones(s))
 
-        if self.dim == 0:
-            constraint_blocks = [
-                (secondary_0, main_0, -cosinus * int_matrix),
-            ]
-        else:
-            rows.append(secondary_1)
-            cols.append(secondary_1)
+        if vec:
+            rows.append(self.sorted_indices[subspace_counter+3])
+            cols.append(self.sorted_indices[subspace_counter+3])
             data.append(np.ones(s))
-            constraint_blocks = [
-                (secondary_0, main_0, -cosinus * int_matrix),
-                (secondary_0, main_1, sinus * int_matrix),
-                (secondary_1, main_0,  -sinus * int_matrix),
-                (secondary_1, main_1, -cosinus * int_matrix),
-            ]
-        
-        for sec, main, values in constraint_blocks:
-            r = np.repeat(sec, m)
-            c = np.tile(main, s)
-            rows.append(r)
-            cols.append(c)
-            if isinstance(values, csr_matrix):
-                data.append(values.toarray().ravel())
-            else:
 
-                data.append(values.ravel())
+        int_matrix_xx = - cosinus * self._create_interpolation_matrix(self.sorted_indices[subspace_counter], self.sorted_indices[subspace_counter+1], degree)
+
+        if vec:
+            int_matrix_xy = - sinus * self._create_interpolation_matrix(self.sorted_indices[subspace_counter+2], self.sorted_indices[subspace_counter+3], degree)
+            int_matrix_yx = sinus * self._create_interpolation_matrix(self.sorted_indices[subspace_counter+4], self.sorted_indices[subspace_counter+5], degree)
+            int_matrix_yy = - cosinus * self._create_interpolation_matrix(self.sorted_indices[subspace_counter+6], self.sorted_indices[subspace_counter+7], degree)
+
+        C = sparse.coo_matrix((np.concatenate(data), (np.concatenate(rows), np.concatenate(cols))), shape=(n_dofs, n_dofs))
         
-        C = sparse.coo_matrix((np.concatenate(data),
-                        (np.concatenate(rows), np.concatenate(cols))),
-                    shape=(n_dofs, n_dofs))
+        C += int_matrix_xx
+        
+        if vec:
+            C += int_matrix_xy + int_matrix_yx + int_matrix_yy
+
         return C.tocsc()
 
     def _implement_pbc_scalarfield(
-            self, dofs_m: list[int], dofs_s: list[int], int_matrix: np.NDArray[float]
+            self, subspace_counter: int, degree: int
         ) -> None:
         '''Changes the rows and columns of a Matrix or a Vector in the corresponding rows and columms
         for a scalarfunction
         
         Args:
-            dofs_m: The dofs on the main side
-            dofs_s: The dofs on the secondary side
-            int_matrix: The interpolation matrix between the main and the secondary side
+            subspace_counter: The number of the current subspace
+            degree: linear or quadratic elements
 
         '''
         sinus, cosinus = 0, 1
-        T = self._create_transformation_matrix(self.matrix_scipy.shape[0], dofs_m, np.array([]), dofs_s, np.array([]), sinus, cosinus, int_matrix)
-        C = self._build_constraint_rows(self.matrix_scipy.shape[0], dofs_m, [], dofs_s, [], sinus, cosinus, int_matrix)
+        T = self._create_transformation_matrix(subspace_counter, degree, False, sinus, cosinus)
+        C = self._build_constraint_rows(subspace_counter, degree, False, sinus, cosinus)
 
         if isinstance(self.tensor, (fenics.PETScMatrix, PETSc.Mat)):
             K_mod = T.T @ self.matrix_scipy
@@ -1109,121 +1116,95 @@ class PeriodicBoundaryInterpolator:
 
         elif isinstance(self.tensor, (fenics.PETScVector, fenics.PETScVector)):
             self.vector = T.T @ self.vector
-            self.vector[dofs_s] = 0.0
+            self.vector[self.sorted_indices[subspace_counter+1]] = 0.0
 
     def _implement_pbc_vectorfield(
-            self, dofs_m_x: list[int], dofs_s_x: list[int], dofs_m_y: list[int], dofs_s_y: list[int], int_matrix: np.NDArray[float]
+            self, subspace_counter: int, degree: int
         ) -> None:
         '''Changes the rows and columns of a Matrix or a Vector in the corresponding rows and columms
         for a vectorfunction
         
         Args:
-            dofs_m_x: The dofs on the main side, specfically the x-value of the vector
-            dofs_s_x: The dofs on the secondary side, specfically the x-value of the vector
-            dofs_m_y: The dofs on the main side, specfically the y-value of the vector
-            dofs_s_y: The dofs on the secondary side, specfically the y-value of the vector
-            int_matrix: The interpolation matrix between the main and the secondary side
+            subspace_counter: The number of the current subspace
+            degree: linear or quadratic interpolation
 
         '''
-        sinus, cosinus = self._calculate_rotation(dofs_m_x, dofs_s_x)
-        T = self._create_transformation_matrix(self.matrix_scipy.shape[0], dofs_m_x, dofs_m_y, dofs_s_x, dofs_s_y, sinus, cosinus, int_matrix)
-        C = self._build_constraint_rows(self.matrix_scipy.shape[0], dofs_m_x, dofs_m_y, dofs_s_x, dofs_s_y, sinus, cosinus, int_matrix)
+        sinus, cosinus = self._calculate_rotation()
+        
+        T = self._create_transformation_matrix(subspace_counter, degree, True, sinus, cosinus)
+        C = self._build_constraint_rows(subspace_counter, degree, True, sinus, cosinus)
 
         if isinstance(self.tensor, (fenics.PETScMatrix, PETSc.Mat)):
-            K_mod = T.T @ self.matrix_scipy
+            K_mod = T.T @ self.matrix_scipy @ T
             self.matrix_scipy = K_mod + C
 
         elif isinstance(self.tensor, (fenics.PETScVector, fenics.PETScVector)):
-            self.vector = T.T @ self.vector
-            self.vector[dofs_s_x] = 0.0
-            self.vector[dofs_s_y] = 0.0
-
-    def _get_dof_distances(
-            self, counter: int
-            ) -> tuple[list[list[int]], list[list[int]]]:
-        '''Returns the relative coordinates of the dofs in anscending order.
-        
-        Args:
-            counter: number of the current subspace
-
-        Returns:
-            rel_dof_distances: an ordered list of the coordinates of the dofs
-
-        '''
-        rel_dof_distances = [[0],[0]]
-
-        for i in range(2):
-            for index, dof in enumerate(self.sorted_indices[2*counter+i]):
-                if index < len(self.sorted_indices[2*counter+i])-1:
-                    rel_dof_distances[i] += [((self.dof_coord[dof][1] - self.dof_coord[self.sorted_indices[2*counter+i][index+1]][1])**2
-                                                    +(self.dof_coord[dof][0] - self.dof_coord[self.sorted_indices[2*counter+i][index+1]][0])**2)**(1/2) 
-                                                    + rel_dof_distances[i][index]]
-            
-        return rel_dof_distances
+            self.vector = T.T @ self.vector @ T
+            self.vector[self.sorted_indices[subspace_counter+2]] = 0.0
+            self.vector[self.sorted_indices[subspace_counter+3]] = 0.0
 
     def _create_interpolation_matrix(
         self,
-        dst: list[float], 
-        src: list[float], 
+        main_nearest: list[int],
+        secondary : list[int],
         degree: int | str
         ) -> np.NDArray[float]:
         """Constructs a interpolation matrix between two given 1-D sets of coordinates.
 
         Args:
-            src: 1-D list of source coordinates in monotone order in a straight line
-            dst: 1-D list of destination coordinates in monotone order in a straight line
+            main_nearest: unordered list of tuples or triples of the nearest dofs of the corresponding secondary list
+            secondary: unordered list of secondary dof indices
             degree: linear or quadratic interpolation
 
         Returns:
             The resulting Numpy Interpolation Matrix
 
         """
-        n_src = len(src)
-        n_dst = len(dst)
-        src = np.array(src)
-        dst = np.array(dst)
-
-        vertex_coords = self.mesh.coordinates()
-        vtx_tree = cKDTree(vertex_coords)
-        dists, _ = vtx_tree.query(self.dof_coord[:, 0])
-
-        is_midpoint = dists > 1e-10
-        midpoint_coords = self.dof_coord[:, 0][is_midpoint]
+        src_coords = np.array(self.dof_coord[main_nearest])
+        dst_coords = np.array(self.dof_coord[secondary])
 
         if degree == 'linear' or degree == 1:
-            interpolation_matrix = np.zeros((n_dst, n_src))
-            basis = np.identity(n_src)
-            for i in range(n_src):
-                interpolation_matrix[:, i] = np.interp(dst, src, basis[i])
-            return interpolation_matrix
+            x  = dst_coords
+            x0 = self.constrained_domain.map(src_coords[:,1,:], np.empty_like(src_coords[:,1,:]))
+            x1 = self.constrained_domain.map(src_coords[:,0,:], np.empty_like(src_coords[:,0,:]))
+
+            ravelled_indices = np.array([main_nearest[:, 1], main_nearest[:, 0]]).T
+
+            v = abs(x1 - x0)
+            u = abs(x - x0)
+            t = np.sum(u * v, axis=1, keepdims=True) / np.sum(v * v, axis=1, keepdims=True)
+
+            w0 = 1-t
+            w1 = t
+
+            row_indices = np.repeat(secondary, 2)
+            col_indices = ravelled_indices.ravel()
+            weights     = np.column_stack([w0, w1]).ravel()
+
+            M = csr_matrix((weights, (row_indices, col_indices)), shape=(self.matrix_scipy.shape[0], self.matrix_scipy.shape[0]))
+            return M
 
         elif degree == 'quadratic' or degree == 2 or degree == 'cubic' or degree == 3:
-            src_2 = []
-            for ind, el in enumerate(src):
-                if ind%2 != 0:
-                    src_2 += [el]
+            x  = dst_coords
+            x0 = self.constrained_domain.map(src_coords[:,1,:], np.empty_like(src_coords[:,1,:]))
+            x1 = self.constrained_domain.map(src_coords[:,0,:], np.empty_like(src_coords[:,0,:]))
+            x2 = self.constrained_domain.map(src_coords[:,2,:], np.empty_like(src_coords[:,2,:]))
 
-            tree = cKDTree(np.array(src_2).reshape(-1,1))
-            k = 1
-            _, indices_2 = tree.query(dst.reshape(-1,1), k=k)
+            ravelled_indices = np.array([main_nearest[:, 1], main_nearest[:, 0], main_nearest[:, 2]]).T
 
-            x  = dst
-            x0 = src[indices_2*2]
-            x1 = src[indices_2*2+1]
-            x2 = src[indices_2*2+2]
+            v = abs(x2 - x0)
+            u = abs(x - x0)
+            t = np.sum(u * v, axis=1, keepdims=True) / np.sum(v * v, axis=1, keepdims=True)
 
-            ravelled_indices = np.array([indices_2*2, indices_2*2+1, indices_2*2+2]).T
+            w0 = 2*t*t - 3*t + 1
+            w1 = 4*t*(1 - t)
+            w2 = t*(2*t - 1)
 
-            d02 = x2 - x0
-            w0 = (x - x0) * (x - x0)/d02/d02  * 2 - 3 * (x - x0)/d02 + 1
-            w1 = 4 * (x - x0)/d02 * (1 - (x - x0)/d02)
-            w2 = (x - x0)/d02 * (2 * (x - x0)/d02 - 1)
-
-            row_indices = np.repeat(np.arange(n_dst), 3)
+            row_indices = np.repeat(secondary, 3)
             col_indices = ravelled_indices.ravel()
             weights     = np.column_stack([w0, w1, w2]).ravel()
 
-            M = csr_matrix((weights, (row_indices, col_indices)), shape=(n_dst, n_src))
+            M = csr_matrix((weights, (row_indices, col_indices)), shape=(self.matrix_scipy.shape[0], self.matrix_scipy.shape[0]))
             return M
 
         else:
@@ -1256,21 +1237,12 @@ class PeriodicBoundaryInterpolator:
         if self.functionspace.num_sub_spaces() == 0:
             degree = self.functionspace.ufl_element().degree()
             self.dim = self.functionspace.num_sub_spaces()
-
-            rel_dof_distances = self._get_dof_distances(0)
-
-            int_matrix = self._create_interpolation_matrix(rel_dof_distances[0],rel_dof_distances[1],degree)
-
-            self._implement_pbc_scalarfield(self.sorted_indices[0], self.sorted_indices[1], int_matrix)
+            self._implement_pbc_scalarfield(0, degree)
 
         elif isinstance(self.functionspace.ufl_element(), fenics.VectorElement):
             degree = self.functionspace.ufl_element().degree()
             self.dim = self.functionspace.num_sub_spaces()
-            rel_dof_distances = self._get_dof_distances(0)
-
-            int_matrix = self._create_interpolation_matrix(rel_dof_distances[1],rel_dof_distances[0],degree)
-
-            self._implement_pbc_vectorfield(self.sorted_indices[0], self.sorted_indices[1], self.sorted_indices[2], self.sorted_indices[3], int_matrix)
+            self._implement_pbc_vectorfield(0, degree)
         
         elif isinstance(self.functionspace.ufl_element(), fenics.MixedElement):
             subspace_counter = 0
@@ -1280,20 +1252,10 @@ class PeriodicBoundaryInterpolator:
                 self.dim = self.functionspace.sub(subspace_index).num_sub_spaces()
 
                 if self.dim == 0:
-                    # rel_dof_distances = self._get_dof_distances(subspace_counter)
-                    
-                    # int_matrix = self._create_interpolation_matrix(rel_dof_distances[0],rel_dof_distances[1],degree)
-                    
-                    # self._implement_pbc_scalarfield(self.sorted_indices[2*subspace_counter], self.sorted_indices[2*subspace_counter+1], int_matrix)
-                    subspace_counter += 1
+                    pass
                 
                 elif isinstance(self.functionspace.sub(subspace_index).ufl_element(), fenics.VectorElement):
-                    rel_dof_distances = self._get_dof_distances(subspace_counter)
-
-                    int_matrix = self._create_interpolation_matrix(rel_dof_distances[1],rel_dof_distances[0],degree)
-
-                    self._implement_pbc_vectorfield(self.sorted_indices[2*subspace_counter], self.sorted_indices[2*subspace_counter+1], self.sorted_indices[2*subspace_counter+2], self.sorted_indices[2*subspace_counter+3], int_matrix)
-        
+                    self._implement_pbc_vectorfield(subspace_counter, degree)
                     subspace_counter += 2
         
         if isinstance(self.tensor, (fenics.PETScMatrix, PETSc.Mat)):
