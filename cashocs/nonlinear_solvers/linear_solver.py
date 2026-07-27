@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING
 
 import fenics
 import numpy as np
+import time
 
 try:
     import ufl_legacy as ufl
@@ -30,11 +31,12 @@ except ImportError:
     import ufl
 
 from cashocs import _utils
+from cashocs import log
 
 if TYPE_CHECKING:
     from cashocs import _typing
 
-
+@log.profile_execution_time("linear_solve", level = log.DEBUG)
 def linear_solve(
     linear_form: ufl.Form,
     u: fenics.Function,
@@ -115,10 +117,15 @@ def linear_solve(
     else:
         P_matrix = None  # pylint: disable=invalid-name
 
+    start = time.time()
     for pbc in pbcs:
         PBI = _utils.PeriodicBoundaryInterpolator(pbc)
-        A_matrix = PBI.apply_periodic_bcs(A_fenics)
-        b = PBI.apply_periodic_bcs(b_fenics)
+        A_matrix = PBI.apply_periodic_bcs(A_matrix)
+        b = PBI.apply_periodic_bcs(b)
+
+    end = time.time()
+
+    print("Elapsed time for PBCs: " + str(end-start) + "seconds")
 
     if linear_solver is None:
         linear_solver = _utils.linalg.LinearSolver()
