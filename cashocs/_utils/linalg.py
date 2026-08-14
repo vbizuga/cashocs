@@ -877,6 +877,31 @@ class PeriodicBoundaryInterpolator:
         self.dof_coord = self.functionspace.tabulate_dof_coordinates()
         self.dof_indices: list = self._locate_dofs()
 
+    def _points_inside(
+            self, coords: np.array
+            ) -> bool:
+        tol = fenics.DOLFIN_EPS
+        test_coords = np.asarray(coords, dtype=float)
+
+        bbt = fenics.BoundingBoxTree()
+        bbt.build(self.mesh)
+        ncells = self.mesh.num_cells()
+
+        mask = np.empty(len(test_coords), dtype=bool)
+        for i, p in enumerate(test_coords):
+            cell = bbt.compute_first_entity_collision(fenics.Point(*p))
+            mask[i] = cell < ncells
+
+        if not bool(mask.all()):
+            for i in np.flatnonzero(~mask):
+                p = test_coords[i]
+                for sh in np.vstack([np.zeros(len(p)), np.eye(len(p))*tol, -np.eye(len(p))*tol]):
+                    if bbt.compute_first_entity_collision(fenics.Point(*(p + sh))) < self.mesh.num_cells():
+                        mask[i] = True
+                        break
+
+        return bool(mask.all())
+
     def _find_indices_scalar(
             self, functionspace: fenics.FunctionSpace
         ) -> list[list[int]]:
@@ -902,13 +927,16 @@ class PeriodicBoundaryInterpolator:
         mapped_coords = np.empty_like(self.dof_coord[indices_main])
         self.constrained_domain.map(self.dof_coord[indices_main], mapped_coords)
 
-        vtx_tree_mapped = cKDTree(mapped_coords)
-        _, sec_verts_indices = vtx_tree_mapped.query(self.dof_coord[indices_second], k=2)
+        if self._points_inside(mapped_coords):
+            vtx_tree_mapped = cKDTree(mapped_coords)
+            _, sec_verts_indices = vtx_tree_mapped.query(self.dof_coord[indices_second], k=len(indices_second))
 
-        nearest_dofs_indices = indices_main[sec_verts_indices]
+            nearest_dofs_indices = indices_main[sec_verts_indices]
 
-        dof_indices.append(nearest_dofs_indices)
-        dof_indices.append(indices_second)
+            dof_indices.append(nearest_dofs_indices)
+            dof_indices.append(indices_second)
+        else:
+            raise RuntimeError('Constrained Domain does not map within mesh')
 
         return dof_indices
     
@@ -936,54 +964,61 @@ class PeriodicBoundaryInterpolator:
             bv_main = aux_bcs[2*i].get_boundary_values()
             indices_main = np.fromiter((dof for dof, val in bv_main.items() if abs(val + 1.0) < fenics.DOLFIN_EPS_LARGE), dtype=np.int32)
 
-            bv_second_x = aux_bcs[i+1-i%2].get_boundary_values()
-            indices_second_x = np.fromiter((dof for dof, val in bv_second_x.items() if abs(val + 1.0) < fenics.DOLFIN_EPS_LARGE), dtype=np.int32)
+            mapped_coords_test = np.empty_like(self.dof_coord[indices_main])
+            self.constrained_domain.map(self.dof_coord[indices_main], mapped_coords_test)
 
-            bv_second_y = aux_bcs[i+3-i%2].get_boundary_values()
-            indices_second_y = np.fromiter((dof for dof, val in bv_second_y.items() if abs(val + 1.0) < fenics.DOLFIN_EPS_LARGE), dtype=np.int32)
+            if self._points_inside(mapped_coords_test):
+                bv_second_x = aux_bcs[i+1-i%2].get_boundary_values()
+                indices_second_x = np.fromiter((dof for dof, val in bv_second_x.items() if abs(val + 1.0) < fenics.DOLFIN_EPS_LARGE), dtype=np.int32)
 
-            if functionspace.ufl_element().degree() == 2:
-                # Betrachte nur Mittelpunkte auf der main Seite
-                vertex_coords = self.mesh.coordinates()
-                vtx_tree = cKDTree(vertex_coords)
-                dists, _ = vtx_tree.query(self.dof_coord[indices_main])
-                is_midpoint = dists > 1e-10
-                filtered_main = self.dof_coord[indices_main][is_midpoint]
+                bv_second_y = aux_bcs[i+3-i%2].get_boundary_values()
+                indices_second_y = np.fromiter((dof for dof, val in bv_second_y.items() if abs(val + 1.0) < fenics.DOLFIN_EPS_LARGE), dtype=np.int32)
 
-                # Main Dofs mappen
-                mapped_coords_filtered = np.empty_like(filtered_main)
-                self.constrained_domain.map(filtered_main, mapped_coords_filtered)
+                if functionspace.ufl_element().degree() == 2:
+                    # Betrachte nur Mittelpunkte auf der main Seite
+                    vertex_coords = self.mesh.coordinates()
+                    vtx_tree = cKDTree(vertex_coords)
+                    dists, _ = vtx_tree.query(self.dof_coord[indices_main])
+                    is_midpoint = dists > 1e-10
+                    filtered_main = self.dof_coord[indices_main][is_midpoint]
 
-                # Suche nach den Mittelpunkten der Main seite, die den second dofs am nächsten sind
-                vtx_tree_filtered = cKDTree(mapped_coords_filtered)
-                _, sec_verts_indices_x = vtx_tree_filtered.query(self.dof_coord[indices_second_x], k=1)
-                _, sec_verts_indices_y = vtx_tree_filtered.query(self.dof_coord[indices_second_y], k=1)
+                    # Main Dofs mappen
+                    mapped_coords_filtered = np.empty_like(filtered_main)
+                    self.constrained_domain.map(filtered_main, mapped_coords_filtered)####
 
-                # Suche die beiden daneben liegenden Dofs der Main seite
-                mapped_coords = np.empty_like(self.dof_coord[indices_main])
-                self.constrained_domain.map(self.dof_coord[indices_main], mapped_coords)
-                coords_tree = cKDTree(mapped_coords)
-                _, sec_coords_indices_x = coords_tree.query(mapped_coords_filtered[sec_verts_indices_x], k=3)
-                _, sec_coords_indices_y = coords_tree.query(mapped_coords_filtered[sec_verts_indices_y], k=3)
+                    # Suche nach den Mittelpunkten der Main seite, die den second dofs am nächsten sind
+                    vtx_tree_filtered = cKDTree(mapped_coords_filtered)
+                    _, sec_verts_indices_x = vtx_tree_filtered.query(self.dof_coord[indices_second_x], k=1)
+                    _, sec_verts_indices_y = vtx_tree_filtered.query(self.dof_coord[indices_second_y], k=1)
+
+                    # Suche die beiden daneben liegenden Dofs der Main seite
+                    mapped_coords = np.empty_like(self.dof_coord[indices_main])
+                    self.constrained_domain.map(self.dof_coord[indices_main], mapped_coords)####
+                    coords_tree = cKDTree(mapped_coords)
+                    _, sec_coords_indices_x = coords_tree.query(mapped_coords_filtered[sec_verts_indices_x], k=3)
+                    _, sec_coords_indices_y = coords_tree.query(mapped_coords_filtered[sec_verts_indices_y], k=3)
+
+                else:
+                    # Main Dofs mappen
+                    mapped_coords = np.empty_like(self.dof_coord[indices_main])
+                    self.constrained_domain.map(self.dof_coord[indices_main], mapped_coords)
+
+                    # Suche nach den Mittelpunkten der Main seite, die den second dofs am nächsten sind
+                    vtx_tree = cKDTree(mapped_coords)
+                    _, sec_coords_indices_x = vtx_tree.query(self.dof_coord[indices_second_x], k=len(indices_second_x))
+                    _, sec_coords_indices_y = vtx_tree.query(self.dof_coord[indices_second_y], k=len(indices_second_y))
+
+                # Suche die globalen Indizes der entsprechenden Dofs
+                nearest_dofs_indices_secx = indices_main[sec_coords_indices_x]
+                nearest_dofs_indices_secy = indices_main[sec_coords_indices_y]
+
+                dof_indices.append(nearest_dofs_indices_secx) #main (x, y)
+                dof_indices.append(indices_second_x) #second (x, x)
+                dof_indices.append(nearest_dofs_indices_secy) #main (x, y)
+                dof_indices.append(indices_second_y) #second (y, y)
 
             else:
-                # Main Dofs mappen
-                mapped_coords = np.empty_like(self.dof_coord[indices_main])
-                self.constrained_domain.map(self.dof_coord[indices_main], mapped_coords)
-
-                # Suche nach den Mittelpunkten der Main seite, die den second dofs am nächsten sind
-                vtx_tree_filtered = cKDTree(mapped_coords)
-                _, sec_coords_indices_x = vtx_tree_filtered.query(self.dof_coord[indices_second_x], k=2)
-                _, sec_coords_indices_y = vtx_tree_filtered.query(self.dof_coord[indices_second_y], k=2)
-
-            # Suche die globalen Indizes der entsprechenden Dofs
-            nearest_dofs_indices_secx = indices_main[sec_coords_indices_x]
-            nearest_dofs_indices_secy = indices_main[sec_coords_indices_y]
-
-            dof_indices.append(nearest_dofs_indices_secx) #main (x, y)
-            dof_indices.append(indices_second_x) #second (x, x)
-            dof_indices.append(nearest_dofs_indices_secy) #main (x, y)
-            dof_indices.append(indices_second_y) #second (y, y)
+                raise RuntimeError('Constrained Domain does not map within mesh')
 
         return dof_indices
 
