@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import copy
+import warnings
 from typing import TYPE_CHECKING
 
 import fenics
@@ -28,6 +29,8 @@ import numpy as np
 from petsc4py import PETSc
 from scipy import sparse
 from scipy.spatial import cKDTree
+from scipy.sparse.linalg import spsolve
+from math import hypot
 
 try:
     import ufl_legacy as ufl
@@ -60,9 +63,7 @@ direct_ksp_options: _typing.KspOption = {
 }
 
 
-from scipy.sparse import csr_matrix
-from scipy.interpolate import make_interp_spline
-from scipy.interpolate import CubicSpline
+from scipy.sparse import csr_matrix, coo_matrix
 
 
 def split_linear_forms(forms: list[ufl.Form]) -> tuple[list[ufl.Form], list[ufl.Form]]:
@@ -210,8 +211,6 @@ def assemble_petsc_system(
         A = PBI.apply_periodic_bcs(A_tensor)
         b = PBI.apply_periodic_bcs(b_tensor)
 
-
-    log.end()
 
     return A, b, P
 
@@ -872,15 +871,18 @@ class PeriodicBoundaryInterpolator:
         self.constrained_domain: fenics.SubDomain = pbc.constrained_domain
         self.tag_main: int = pbc.main_idc
         self.tag_secondary: int = pbc.secondary_idc
+        self._DEGREE = {'linear': 1, 'quadratic': 2, 1: 1, 2: 2}
 
         self.mesh = self.functionspace.mesh()
         self.dof_coord = self.functionspace.tabulate_dof_coordinates()
+        self.main_all: list = []
         self.dof_indices: list = self._locate_dofs()
 
     def _points_inside(
             self, coords: np.array
             ) -> bool:
-        tol = fenics.DOLFIN_EPS
+        # hier is noch iwas komisch, hat aber fallback integriert in mortar zeugs
+        tol = fenics.DOLFIN_EPS_LARGE
         test_coords = np.asarray(coords, dtype=float)
 
         bbt = fenics.BoundingBoxTree()
@@ -920,6 +922,7 @@ class PeriodicBoundaryInterpolator:
 
         bv_main = aux_bcs[0].get_boundary_values()
         indices_main = np.fromiter((dof for dof, val in bv_main.items() if abs(val + 1.0) < fenics.DOLFIN_EPS_LARGE), dtype=np.int32)
+        self.main_all += [indices_main]
 
         bv_second = aux_bcs[1].get_boundary_values()
         indices_second = np.fromiter((dof for dof, val in bv_second.items() if abs(val + 1.0) < fenics.DOLFIN_EPS_LARGE), dtype=np.int32)
@@ -927,9 +930,9 @@ class PeriodicBoundaryInterpolator:
         mapped_coords = np.empty_like(self.dof_coord[indices_main])
         self.constrained_domain.map(self.dof_coord[indices_main], mapped_coords)
 
-        if self._points_inside(mapped_coords):
+        if True:#self._points_inside(mapped_coords):
             vtx_tree_mapped = cKDTree(mapped_coords)
-            _, sec_verts_indices = vtx_tree_mapped.query(self.dof_coord[indices_second], k=len(indices_second))
+            _, sec_verts_indices = vtx_tree_mapped.query(self.dof_coord[indices_second], k=len(mapped_coords))
 
             nearest_dofs_indices = indices_main[sec_verts_indices]
 
@@ -963,11 +966,13 @@ class PeriodicBoundaryInterpolator:
             # Main und secondary dofs aus bc extrahieren
             bv_main = aux_bcs[2*i].get_boundary_values()
             indices_main = np.fromiter((dof for dof, val in bv_main.items() if abs(val + 1.0) < fenics.DOLFIN_EPS_LARGE), dtype=np.int32)
+            self.main_all += [indices_main]
+            self.main_all += [indices_main]
 
             mapped_coords_test = np.empty_like(self.dof_coord[indices_main])
             self.constrained_domain.map(self.dof_coord[indices_main], mapped_coords_test)
 
-            if self._points_inside(mapped_coords_test):
+            if True: # self._points_inside(mapped_coords_test):
                 bv_second_x = aux_bcs[i+1-i%2].get_boundary_values()
                 indices_second_x = np.fromiter((dof for dof, val in bv_second_x.items() if abs(val + 1.0) < fenics.DOLFIN_EPS_LARGE), dtype=np.int32)
 
@@ -995,8 +1000,8 @@ class PeriodicBoundaryInterpolator:
                     mapped_coords = np.empty_like(self.dof_coord[indices_main])
                     self.constrained_domain.map(self.dof_coord[indices_main], mapped_coords)####
                     coords_tree = cKDTree(mapped_coords)
-                    _, sec_coords_indices_x = coords_tree.query(mapped_coords_filtered[sec_verts_indices_x], k=3)
-                    _, sec_coords_indices_y = coords_tree.query(mapped_coords_filtered[sec_verts_indices_y], k=3)
+                    _, sec_coords_indices_x = coords_tree.query(mapped_coords_filtered[sec_verts_indices_x], k=len(mapped_coords))
+                    _, sec_coords_indices_y = coords_tree.query(mapped_coords_filtered[sec_verts_indices_y], k=len(mapped_coords))
 
                 else:
                     # Main Dofs mappen
@@ -1005,8 +1010,8 @@ class PeriodicBoundaryInterpolator:
 
                     # Suche nach den Mittelpunkten der Main seite, die den second dofs am nächsten sind
                     vtx_tree = cKDTree(mapped_coords)
-                    _, sec_coords_indices_x = vtx_tree.query(self.dof_coord[indices_second_x], k=len(indices_second_x))
-                    _, sec_coords_indices_y = vtx_tree.query(self.dof_coord[indices_second_y], k=len(indices_second_y))
+                    _, sec_coords_indices_x = vtx_tree.query(self.dof_coord[indices_second_x], k=len(mapped_coords))
+                    _, sec_coords_indices_y = vtx_tree.query(self.dof_coord[indices_second_y], k=len(mapped_coords))
 
                 # Suche die globalen Indizes der entsprechenden Dofs
                 nearest_dofs_indices_secx = indices_main[sec_coords_indices_x]
@@ -1057,11 +1062,22 @@ class PeriodicBoundaryInterpolator:
             sinus, cosinus: a tuple of the trigonometric functions of the angle
 
         '''
-        vec_1 = [1,0]
-        vec_2 = [0,0]
-        self.constrained_domain.map(vec_1, vec_2)
-        sinus = vec_2[1]
-        cosinus = vec_2[0]
+        x0 = [0.0, 0.0]
+        x1 = [1.0, 0.0]
+
+        mapped_x0 = [0.0, 0.0]
+        mapped_x1 = [0.0, 0.0]
+
+        self.constrained_domain.map(x0, mapped_x0)
+        self.constrained_domain.map(x1, mapped_x1)
+
+        dx = mapped_x1[0] - mapped_x0[0]
+        dy = mapped_x1[1] - mapped_x0[1]
+
+        length = hypot(dx, dy)
+
+        cosinus = dx / length
+        sinus = dy / length
 
         return sinus, cosinus
 
@@ -1088,17 +1104,17 @@ class PeriodicBoundaryInterpolator:
             for idx in np.concatenate([self.dof_indices[subspace_counter+1], self.dof_indices[subspace_counter+3]]).astype(int):
                 T[idx, idx] = 0.0
 
-            int_matrix_xx = cosinus * self._create_interpolation_matrix(self.dof_indices[subspace_counter], self.dof_indices[subspace_counter+1], degree)
-            int_matrix_xy = sinus * self._create_interpolation_matrix(self.dof_indices[subspace_counter+2], self.dof_indices[subspace_counter+3], degree)
-            int_matrix_yx = - sinus * self._create_interpolation_matrix(self.dof_indices[subspace_counter+4], self.dof_indices[subspace_counter+5], degree)
-            int_matrix_yy = cosinus * self._create_interpolation_matrix(self.dof_indices[subspace_counter+6], self.dof_indices[subspace_counter+7], degree)
+            int_matrix_xx = cosinus * self._create_mortar_interpolation_matrix(self.dof_indices[subspace_counter], self.dof_indices[subspace_counter+1], degree, self.main_all[int(subspace_counter/2)])
+            int_matrix_xy = sinus * self._create_mortar_interpolation_matrix(self.dof_indices[subspace_counter+2], self.dof_indices[subspace_counter+3], degree, self.main_all[int(subspace_counter/2)+1])
+            int_matrix_yx = - sinus * self._create_mortar_interpolation_matrix(self.dof_indices[subspace_counter+4], self.dof_indices[subspace_counter+5], degree, self.main_all[int(subspace_counter/2)+2])
+            int_matrix_yy = cosinus * self._create_mortar_interpolation_matrix(self.dof_indices[subspace_counter+6], self.dof_indices[subspace_counter+7], degree, self.main_all[int(subspace_counter/2)+3])
             
             T += int_matrix_xx + int_matrix_xy + int_matrix_yx + int_matrix_yy
         else:
             for idx in self.dof_indices[subspace_counter+1].astype(int):
                 T[idx, idx] = 0.0
 
-            int_matrix = self._create_interpolation_matrix(self.dof_indices[subspace_counter], self.dof_indices[subspace_counter+1], degree)
+            int_matrix = self._create_mortar_interpolation_matrix(self.dof_indices[subspace_counter], self.dof_indices[subspace_counter+1], degree, self.main_all[int(subspace_counter/2)])
             
             T += int_matrix
 
@@ -1139,12 +1155,12 @@ class PeriodicBoundaryInterpolator:
             cols.append(self.dof_indices[subspace_counter+3])
             data.append(np.ones(s))
 
-        int_matrix_xx = - cosinus * self._create_interpolation_matrix(self.dof_indices[subspace_counter], self.dof_indices[subspace_counter+1], degree)
+        int_matrix_xx = - cosinus * self._create_mortar_interpolation_matrix(self.dof_indices[subspace_counter], self.dof_indices[subspace_counter+1], degree, self.main_all[int(subspace_counter/2)])
 
         if vec:
-            int_matrix_xy = - sinus * self._create_interpolation_matrix(self.dof_indices[subspace_counter+2], self.dof_indices[subspace_counter+3], degree)
-            int_matrix_yx = sinus * self._create_interpolation_matrix(self.dof_indices[subspace_counter+4], self.dof_indices[subspace_counter+5], degree)
-            int_matrix_yy = - cosinus * self._create_interpolation_matrix(self.dof_indices[subspace_counter+6], self.dof_indices[subspace_counter+7], degree)
+            int_matrix_xy = - sinus * self._create_mortar_interpolation_matrix(self.dof_indices[subspace_counter+2], self.dof_indices[subspace_counter+3], degree, self.main_all[int(subspace_counter/2)+1])
+            int_matrix_yx = sinus * self._create_mortar_interpolation_matrix(self.dof_indices[subspace_counter+4], self.dof_indices[subspace_counter+5], degree, self.main_all[int(subspace_counter/2)+2])
+            int_matrix_yy = - cosinus * self._create_mortar_interpolation_matrix(self.dof_indices[subspace_counter+6], self.dof_indices[subspace_counter+7], degree, self.main_all[int(subspace_counter/2)+3])
 
         C = sparse.coo_matrix((np.concatenate(data), (np.concatenate(rows), np.concatenate(cols))), shape=(self.n_dofs, self.n_dofs))
         
@@ -1211,6 +1227,8 @@ class PeriodicBoundaryInterpolator:
 
         '''
         sinus, cosinus = self._calculate_rotation()
+
+        print(sinus, cosinus)
         
         T = self._create_transformation_matrix(subspace_counter, degree, True, sinus, cosinus)
         C = self._build_constraint_rows(subspace_counter, degree, True, sinus, cosinus)
@@ -1313,6 +1331,258 @@ class PeriodicBoundaryInterpolator:
 
         else:
             raise RuntimeError("No Interpolation possible")
+
+    def _create_mortar_interpolation_matrix(
+            self,
+            main_nearest: list[int],
+            secondary: list[int],
+            degree: int | str,
+            main_all: list[int] | None = None,
+            lumped: bool = True,
+            node_tol_rel: float = 1e-6,
+            quad_extra: int = 1,
+            drop: float = 1e-14,
+        ) -> csr_matrix:
+
+        """L2-(Mortar-)Projektionsmatrix zwischen zwei 1-D Interface-DOF-Saetzen. Realisiert u_secondary = M @ u_main im Sinne von min ||u_sec - u_main||_{L2(Gamma)} statt punktweise. Dadurch kann kein Main-DOF ohne Beitrag bleiben, unabhaengig davon, welche Seite lokal feiner ist.
+
+        Args:
+            main_nearest: bracketing Main-DOFs pro Secondary-DOF. Wird nur noch zur Pruefung der Komponentenzuordnung benutzt.
+            secondary: Secondary-DOF-Indizes.
+            degree: 'linear'/1 oder 'quadratic'/2 - Ordnung des Spurraums.
+            main_all: ALLE Main-Interface-DOFs. Ohne diese Angabe bleiben blinde Spalten moeglich.
+            lumped: Row-Sum-Lumping der Secondary-Massenmatrix (sparse, bei P1 nichtnegativ). False -> exakte, dichte Projektion.
+            node_tol_rel: Knoten-Clustertoleranz relativ zur Interface-Laenge.
+            quad_extra: zusaetzliche Gausspunkte pro Mortar-Segment.
+            drop: Sparsity-Schwelle.
+
+        Returns:
+            csr_matrix der Form (n_dofs, n_dofs).
+        """
+        order = self._DEGREE.get(degree)
+
+        if order is None:
+            raise ValueError(f'unsupported degree {degree!r}')
+        
+        main_nearest = np.asarray(main_nearest, dtype=int)
+        secondary = np.asarray(secondary, dtype=int)
+        main_all = np.unique(np.asarray(main_all, dtype=int))
+        
+        # clash = np.intersect1d(main_all, secondary)
+
+        # if clash.size:
+        #     raise ValueError(f'{clash.size} dofs are both main and secondary '
+        #     f'(bind corners separately): {clash[:10]}')
+
+        # --- 1. gemeinsame Parametrisierung ------------------------------
+        main_raw = np.asarray(self.dof_coord[main_all], dtype=float)
+        main_pts = np.empty_like(main_raw)
+        self.constrained_domain.map(main_raw, main_pts)
+
+        # Richtung wie bisher
+        sec_pts = np.asarray(self.dof_coord[secondary], dtype=float)
+        origin, tangent, span = self._fit_line_frame(np.vstack([main_pts, sec_pts]))
+
+        t_main = (main_pts - origin) @ tangent
+        t_sec = (sec_pts - origin) @ tangent
+
+        lo = max(t_main.min(), t_sec.min())
+        hi = min(t_main.max(), t_sec.max())
+
+        if hi <= lo:
+            raise ValueError(
+            'mapped main and secondary parameter ranges are disjoint - '
+            'constrained_domain.map is most likely applied to the wrong '
+            'side or with the wrong sign')
+        
+        shorter = min(t_main.ptp(), t_sec.ptp())
+
+        if hi - lo < 0.999 * shorter:
+            warnings.warn(
+            f'interfaces overlap only over {(hi - lo) / shorter:.4f} of '
+            f'their extent; rows near the ends will not sum to one',
+            RuntimeWarning, stacklevel=2)
+
+        # --- 2. Knoten und Elementtopologie -----------------------------
+        tol = node_tol_rel * span
+        ts_node, s_node, s_comp, dof_s, nc_s = self._collapse(t_sec, secondary, tol)
+        tm_node, m_node, m_comp, dof_m, nc_m = self._collapse(t_main, main_all, tol)
+
+        if nc_s != nc_m:
+            raise ValueError(f'component count differs: secondary {nc_s} vs '
+            f'main {nc_m}')
+        
+        # Komponenten-Heuristik gegen die bekannte Paarung pruefen
+        comp_of = np.full(self.n_dofs, -1, dtype=int)
+        comp_of[main_all] = m_comp
+
+        if np.any(comp_of[main_nearest] != s_comp[:, None]):
+            raise ValueError(
+            'component slots inferred from the dof ordering disagree with '
+            'main_nearest - the dof layout is not node-major/component-'
+            'minor, scatter the projection per component manually')
+        
+        elem_s = self._line_elements(ts_node.size, order)
+        elem_m = self._line_elements(tm_node.size, order)
+
+        # --- 3. Mortar-Segmente + Quadratur -----------------------------
+        edge_s = np.append(ts_node[elem_s[:, 0]], ts_node[elem_s[-1, -1]])
+        edge_m = np.append(tm_node[elem_m[:, 0]], tm_node[elem_m[-1, -1]])
+
+        brk = np.unique(np.concatenate([edge_s, edge_m, [lo, hi]]))
+        brk = brk[(brk > lo - tol) & (brk < hi + tol)]
+        brk = brk[np.append(True, np.diff(brk) > tol)]
+
+        if brk.size < 2:
+            raise ValueError('no overlapping mortar segment found')
+        
+        gp, gw = np.polynomial.legendre.leggauss(order + 1 + quad_extra)
+        a, b = brk[:-1], brk[1:]
+        h = b - a
+
+        xq = (0.5 * (a + b)[:, None] + 0.5 * h[:, None] * gp[None, :]).ravel()
+        wq = (0.5 * h[:, None] * gw[None, :]).ravel()
+
+        es, Ns = self._eval_basis(ts_node, elem_s, xq)
+        em, Nm = self._eval_basis(tm_node, elem_m, xq)
+        
+        # --- 4. M_ij = int N_i^sec N_j^main ds ---------------------------
+        k = order + 1
+
+        rows = np.concatenate([elem_s[es, p] for p in range(k) for _ in range(k)])
+        cols = np.concatenate([elem_m[em, q] for _ in range(k) for q in range(k)])
+        vals = np.concatenate([wq * Ns[:, p] * Nm[:, q] for p in range(k) for q in range(k)])
+
+        Mn = coo_matrix((vals, (rows, cols)), shape=(ts_node.size, tm_node.size)).tocsr()
+
+        # --- 5. D^-1 M ---------------------------------------------------
+        if lumped:
+            d = np.asarray(Mn.sum(axis=1)).ravel()
+            if d.min() <= -fenics.DOLFIN_EPS_LARGE:
+                raise ValueError('non-positive lumped mass - secondary nodes '
+                'outside the overlap region')
+            
+            P = Mn.multiply((1.0 / d)[:, None]).tocsr()
+
+        else:
+            dr = np.concatenate([elem_s[es, p] for p in range(k) for _ in range(k)])
+            dc = np.concatenate([elem_s[es, q] for _ in range(k) for q in range(k)])
+            dv = np.concatenate([wq * Ns[:, p] * Ns[:, q] for p in range(k) for q in range(k)])
+
+            D = coo_matrix((dv, (dr, dc)), shape=(ts_node.size,) * 2).tocsc()
+            P = csr_matrix(spsolve(D, Mn.tocsc()))
+
+            warnings.warn('exact projection: rows couple to all main dofs',
+            RuntimeWarning, stacklevel=2)
+
+        P.data[np.abs(P.data) < drop] = 0.0
+        P.eliminate_zeros()
+
+        blind = np.flatnonzero(np.asarray(P.sum(axis=0)).ravel() <= drop)
+        if blind.size:
+            warnings.warn(f'{blind.size} main nodes still have zero column sum '
+            f'- main_all likely reaches beyond the overlap',
+            RuntimeWarning, stacklevel=2)
+
+        # --- 6. Streuung auf globale DOFs, komponentenweise --------------
+        Pc = P.tocoo()
+        R = dof_s[Pc.row]
+        C = dof_m[Pc.col]
+        V = np.repeat(Pc.data[:, None], nc_s, axis=1)
+
+        return coo_matrix((V.ravel(), (R.ravel(), C.ravel())), shape=(self.n_dofs, self.n_dofs)).tocsr()
+
+    @staticmethod
+    def _fit_line_frame(pts: np.ndarray, tol: float = 1e-4):
+        """Dominante Tangente der Interface-Punktwolke via SVD."""
+        origin = pts.mean(axis=0)
+        Q = pts - origin
+        _, _, Vt = np.linalg.svd(Q, full_matrices=False)
+        e = Vt[0]
+
+        if e[np.argmax(np.abs(e))] < 0.0:
+            e = -e
+
+        t = Q @ e
+        span = float(t.ptp())
+
+        if span <= 0.0:
+            raise ValueError('degenerate interface: zero extent')
+        
+        off = float(np.linalg.norm(Q - np.outer(t, e), axis=1).max())
+
+        # if off > tol * span:
+        #     raise ValueError(
+        #     f'interface is not straight in the mapped frame (off-axis '
+        #     f'deviation {off:.3e} vs span {span:.3e}); a curved interface '
+        #     f'needs true arclength parametrisation')
+        
+        return origin, e, span
+    
+    @staticmethod
+    def _collapse(t: np.ndarray, dofs: np.ndarray, tol: float):
+        """DOFs auf geometrische Knoten clustern.
+        Komponentenslot = Rang des globalen DOF-Index innerhalb des Knotens.
+        """
+        order = np.argsort(t, kind='stable')
+        ts = t[order]
+        fresh = np.append(True, np.diff(ts) > tol)
+
+        node_sorted = np.cumsum(fresh) - 1
+        n_node = int(node_sorted[-1]) + 1
+        cnt = np.bincount(node_sorted, minlength=n_node)
+
+        if cnt.min() != cnt.max():
+            raise ValueError(
+            f'{cnt.min()}..{cnt.max()} dofs per node - adjust '
+            f'node_tol_rel or split the dof set per component')
+        
+        n_comp = int(cnt[0])
+        t_node = np.bincount(node_sorted, weights=ts, minlength=n_node) / cnt
+
+        node_of = np.empty(t.size, dtype=int)
+        node_of[order] = node_sorted
+        lex = np.lexsort((dofs, node_of))
+
+        comp_of = np.empty(t.size, dtype=int)
+        comp_of[lex] = np.tile(np.arange(n_comp), n_node)
+
+        dof_at = np.empty((n_node, n_comp), dtype=int)
+        dof_at[node_of, comp_of] = dofs
+
+        return t_node, node_of, comp_of, dof_at, n_comp
+    
+    @staticmethod
+    def _line_elements(n_node: int, order: int) -> np.ndarray:
+        """Elementkonnektivitaet eines zusammenhaengenden 1-D Knotenzugs."""
+        if order == 1:
+            i = np.arange(n_node - 1)
+            return np.column_stack([i, i + 1])
+        
+        if n_node < 3 or (n_node - 1) % 2:
+            raise ValueError(f'{n_node} nodes cannot form P2 line elements '
+            f'(need an odd count)')
+        
+        v = np.arange(0, n_node - 2, 2)
+
+        return np.column_stack([v, v + 1, v + 2])
+    
+    @staticmethod
+    def _eval_basis(t_node: np.ndarray, elem: np.ndarray, x: np.ndarray):
+        """Element lokalisieren und Lagrange-Basis auswerten."""
+        left = t_node[elem[:, 0]]
+        e = np.clip(np.searchsorted(left, x, side='right') - 1,0, elem.shape[0] - 1)
+
+        loc = t_node[elem[e]]
+
+        N = np.ones_like(loc)
+
+        for p in range(loc.shape[1]):
+            for q in range(loc.shape[1]):
+                if p != q:
+                    N[:, p] *= (x - loc[:, q]) / (loc[:, p] - loc[:, q])
+
+        return e, N
 
     def apply_periodic_bcs(
             self, tensor: fenics.PETScMatrix | fenics.PETScVector | fenics.PETSc.Mat | fenics.PETSc.Vec

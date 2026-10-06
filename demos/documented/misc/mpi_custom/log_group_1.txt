@@ -1,0 +1,6 @@
+2026-09-25T13:32:12.929504 | Start: Importing mesh.
+2026-09-25T13:32:12.930127 | ----------------------
+2026-09-25T13:32:12.958303 |   Successfully imported 2-dimensional mesh on 1 CPU(s).
+2026-09-25T13:32:12.958806 |   Mesh contains 713 vertices and 1,340 cells of type triangle.
+2026-09-25T13:32:12.959156 | Finish: Importing mesh. -- Elapsed time: 0:00:00.029653
+2026-09-25T13:32:12.959156 | 

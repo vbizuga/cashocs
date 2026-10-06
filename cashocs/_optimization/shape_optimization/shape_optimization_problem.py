@@ -297,7 +297,7 @@ class ShapeOptimizationProblem(optimization_problem.OptimizationProblem):
             self, self.db, self.shape_regularization
         )
 
-        self.form_handler.setup_pbcs_shape(shape_bcs_list)
+        self.form_handler.setup_pbcs_shape(bcs_list)
 
         if self.db.parameter_db.temp_dict:
             self.db.parameter_db.temp_dict["Regularization"] = {
