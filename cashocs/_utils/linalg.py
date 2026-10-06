@@ -878,32 +878,6 @@ class PeriodicBoundaryInterpolator:
         self.main_all: list = []
         self.dof_indices: list = self._locate_dofs()
 
-    def _points_inside(
-            self, coords: np.array
-            ) -> bool:
-        # hier is noch iwas komisch, hat aber fallback integriert in mortar zeugs
-        tol = fenics.DOLFIN_EPS_LARGE
-        test_coords = np.asarray(coords, dtype=float)
-
-        bbt = fenics.BoundingBoxTree()
-        bbt.build(self.mesh)
-        ncells = self.mesh.num_cells()
-
-        mask = np.empty(len(test_coords), dtype=bool)
-        for i, p in enumerate(test_coords):
-            cell = bbt.compute_first_entity_collision(fenics.Point(*p))
-            mask[i] = cell < ncells
-
-        if not bool(mask.all()):
-            for i in np.flatnonzero(~mask):
-                p = test_coords[i]
-                for sh in np.vstack([np.zeros(len(p)), np.eye(len(p))*tol, -np.eye(len(p))*tol]):
-                    if bbt.compute_first_entity_collision(fenics.Point(*(p + sh))) < self.mesh.num_cells():
-                        mask[i] = True
-                        break
-
-        return bool(mask.all())
-
     def _find_indices_scalar(
             self, functionspace: fenics.FunctionSpace
         ) -> list[list[int]]:
@@ -930,16 +904,13 @@ class PeriodicBoundaryInterpolator:
         mapped_coords = np.empty_like(self.dof_coord[indices_main])
         self.constrained_domain.map(self.dof_coord[indices_main], mapped_coords)
 
-        if True:#self._points_inside(mapped_coords):
-            vtx_tree_mapped = cKDTree(mapped_coords)
-            _, sec_verts_indices = vtx_tree_mapped.query(self.dof_coord[indices_second], k=len(mapped_coords))
+        vtx_tree_mapped = cKDTree(mapped_coords)
+        _, sec_verts_indices = vtx_tree_mapped.query(self.dof_coord[indices_second], k=len(mapped_coords))
 
-            nearest_dofs_indices = indices_main[sec_verts_indices]
+        nearest_dofs_indices = indices_main[sec_verts_indices]
 
-            dof_indices.append(nearest_dofs_indices)
-            dof_indices.append(indices_second)
-        else:
-            raise RuntimeError('Constrained Domain does not map within mesh')
+        dof_indices.append(nearest_dofs_indices)
+        dof_indices.append(indices_second)
 
         return dof_indices
     
@@ -972,58 +943,54 @@ class PeriodicBoundaryInterpolator:
             mapped_coords_test = np.empty_like(self.dof_coord[indices_main])
             self.constrained_domain.map(self.dof_coord[indices_main], mapped_coords_test)
 
-            if True: # self._points_inside(mapped_coords_test):
-                bv_second_x = aux_bcs[i+1-i%2].get_boundary_values()
-                indices_second_x = np.fromiter((dof for dof, val in bv_second_x.items() if abs(val + 1.0) < fenics.DOLFIN_EPS_LARGE), dtype=np.int32)
+            bv_second_x = aux_bcs[i+1-i%2].get_boundary_values()
+            indices_second_x = np.fromiter((dof for dof, val in bv_second_x.items() if abs(val + 1.0) < fenics.DOLFIN_EPS_LARGE), dtype=np.int32)
 
-                bv_second_y = aux_bcs[i+3-i%2].get_boundary_values()
-                indices_second_y = np.fromiter((dof for dof, val in bv_second_y.items() if abs(val + 1.0) < fenics.DOLFIN_EPS_LARGE), dtype=np.int32)
+            bv_second_y = aux_bcs[i+3-i%2].get_boundary_values()
+            indices_second_y = np.fromiter((dof for dof, val in bv_second_y.items() if abs(val + 1.0) < fenics.DOLFIN_EPS_LARGE), dtype=np.int32)
 
-                if functionspace.ufl_element().degree() == 2:
-                    # Betrachte nur Mittelpunkte auf der main Seite
-                    vertex_coords = self.mesh.coordinates()
-                    vtx_tree = cKDTree(vertex_coords)
-                    dists, _ = vtx_tree.query(self.dof_coord[indices_main])
-                    is_midpoint = dists > 1e-10
-                    filtered_main = self.dof_coord[indices_main][is_midpoint]
+            if functionspace.ufl_element().degree() == 2:
+                # Betrachte nur Mittelpunkte auf der main Seite
+                vertex_coords = self.mesh.coordinates()
+                vtx_tree = cKDTree(vertex_coords)
+                dists, _ = vtx_tree.query(self.dof_coord[indices_main])
+                is_midpoint = dists > 1e-10
+                filtered_main = self.dof_coord[indices_main][is_midpoint]
 
-                    # Main Dofs mappen
-                    mapped_coords_filtered = np.empty_like(filtered_main)
-                    self.constrained_domain.map(filtered_main, mapped_coords_filtered)####
+                # Main Dofs mappen
+                mapped_coords_filtered = np.empty_like(filtered_main)
+                self.constrained_domain.map(filtered_main, mapped_coords_filtered)####
 
-                    # Suche nach den Mittelpunkten der Main seite, die den second dofs am nächsten sind
-                    vtx_tree_filtered = cKDTree(mapped_coords_filtered)
-                    _, sec_verts_indices_x = vtx_tree_filtered.query(self.dof_coord[indices_second_x], k=1)
-                    _, sec_verts_indices_y = vtx_tree_filtered.query(self.dof_coord[indices_second_y], k=1)
+                # Suche nach den Mittelpunkten der Main seite, die den second dofs am nächsten sind
+                vtx_tree_filtered = cKDTree(mapped_coords_filtered)
+                _, sec_verts_indices_x = vtx_tree_filtered.query(self.dof_coord[indices_second_x], k=1)
+                _, sec_verts_indices_y = vtx_tree_filtered.query(self.dof_coord[indices_second_y], k=1)
 
-                    # Suche die beiden daneben liegenden Dofs der Main seite
-                    mapped_coords = np.empty_like(self.dof_coord[indices_main])
-                    self.constrained_domain.map(self.dof_coord[indices_main], mapped_coords)####
-                    coords_tree = cKDTree(mapped_coords)
-                    _, sec_coords_indices_x = coords_tree.query(mapped_coords_filtered[sec_verts_indices_x], k=len(mapped_coords))
-                    _, sec_coords_indices_y = coords_tree.query(mapped_coords_filtered[sec_verts_indices_y], k=len(mapped_coords))
-
-                else:
-                    # Main Dofs mappen
-                    mapped_coords = np.empty_like(self.dof_coord[indices_main])
-                    self.constrained_domain.map(self.dof_coord[indices_main], mapped_coords)
-
-                    # Suche nach den Mittelpunkten der Main seite, die den second dofs am nächsten sind
-                    vtx_tree = cKDTree(mapped_coords)
-                    _, sec_coords_indices_x = vtx_tree.query(self.dof_coord[indices_second_x], k=len(mapped_coords))
-                    _, sec_coords_indices_y = vtx_tree.query(self.dof_coord[indices_second_y], k=len(mapped_coords))
-
-                # Suche die globalen Indizes der entsprechenden Dofs
-                nearest_dofs_indices_secx = indices_main[sec_coords_indices_x]
-                nearest_dofs_indices_secy = indices_main[sec_coords_indices_y]
-
-                dof_indices.append(nearest_dofs_indices_secx) #main (x, y)
-                dof_indices.append(indices_second_x) #second (x, x)
-                dof_indices.append(nearest_dofs_indices_secy) #main (x, y)
-                dof_indices.append(indices_second_y) #second (y, y)
+                # Suche die beiden daneben liegenden Dofs der Main seite
+                mapped_coords = np.empty_like(self.dof_coord[indices_main])
+                self.constrained_domain.map(self.dof_coord[indices_main], mapped_coords)####
+                coords_tree = cKDTree(mapped_coords)
+                _, sec_coords_indices_x = coords_tree.query(mapped_coords_filtered[sec_verts_indices_x], k=len(mapped_coords))
+                _, sec_coords_indices_y = coords_tree.query(mapped_coords_filtered[sec_verts_indices_y], k=len(mapped_coords))
 
             else:
-                raise RuntimeError('Constrained Domain does not map within mesh')
+                # Main Dofs mappen
+                mapped_coords = np.empty_like(self.dof_coord[indices_main])
+                self.constrained_domain.map(self.dof_coord[indices_main], mapped_coords)
+
+                # Suche nach den Mittelpunkten der Main seite, die den second dofs am nächsten sind
+                vtx_tree = cKDTree(mapped_coords)
+                _, sec_coords_indices_x = vtx_tree.query(self.dof_coord[indices_second_x], k=len(mapped_coords))
+                _, sec_coords_indices_y = vtx_tree.query(self.dof_coord[indices_second_y], k=len(mapped_coords))
+
+            # Suche die globalen Indizes der entsprechenden Dofs
+            nearest_dofs_indices_secx = indices_main[sec_coords_indices_x]
+            nearest_dofs_indices_secy = indices_main[sec_coords_indices_y]
+
+            dof_indices.append(nearest_dofs_indices_secx) #main (x, y)
+            dof_indices.append(indices_second_x) #second (x, x)
+            dof_indices.append(nearest_dofs_indices_secy) #main (x, y)
+            dof_indices.append(indices_second_y) #second (y, y)
 
         return dof_indices
 
@@ -1227,8 +1194,6 @@ class PeriodicBoundaryInterpolator:
 
         '''
         sinus, cosinus = self._calculate_rotation()
-
-        print(sinus, cosinus)
         
         T = self._create_transformation_matrix(subspace_counter, degree, True, sinus, cosinus)
         C = self._build_constraint_rows(subspace_counter, degree, True, sinus, cosinus)
@@ -1259,78 +1224,6 @@ class PeriodicBoundaryInterpolator:
 
             y.setArray(y_arr)
             self.vector = y
-
-    def _create_interpolation_matrix(
-        self,
-        main_nearest: list[int],
-        secondary : list[int],
-        degree: int | str
-        ) -> np.NDArray[float]:
-        """Constructs a interpolation matrix between two given 1-D sets of coordinates.
-
-        Args:
-            main_nearest: unordered list of tuples or triples of the nearest dofs of the corresponding secondary list
-            secondary: unordered list of secondary dof indices
-            degree: linear or quadratic interpolation
-
-        Returns:
-            The resulting Numpy Interpolation Matrix
-
-        """
-        src_coords = np.array(self.dof_coord[main_nearest])
-        dst_coords = np.array(self.dof_coord[secondary])
-
-        if degree == 'linear' or degree == 1:
-            x  = dst_coords
-            x0 = np.empty_like(src_coords[:,1,:])
-            x1 = np.empty_like(src_coords[:,0,:])
-            self.constrained_domain.map(src_coords[:,1,:], x0)
-            self.constrained_domain.map(src_coords[:,0,:], x1)
-
-            ravelled_indices = np.array([main_nearest[:, 1], main_nearest[:, 0]]).T
-
-            v = x1 - x0
-            u = x - x0
-            t = np.sum(u * v, axis=1, keepdims=True) / np.sum(v * v, axis=1, keepdims=True)
-
-            w0 = 1-t
-            w1 = t
-
-            row_indices = np.repeat(secondary, 2)
-            col_indices = ravelled_indices.ravel()
-            weights     = np.column_stack([w0, w1]).ravel()
-
-            M = csr_matrix((weights, (row_indices, col_indices)), shape=(self.n_dofs, self.n_dofs))
-            return M
-
-        elif degree == 'quadratic' or degree == 2 or degree == 'cubic' or degree == 3:
-            x  = dst_coords
-            x0 = np.empty_like(src_coords[:,1,:])
-            x1 = np.empty_like(src_coords[:,0,:])
-            x2 = np.empty_like(src_coords[:,2,:])
-            self.constrained_domain.map(src_coords[:,1,:], x0)
-            self.constrained_domain.map(src_coords[:,0,:], x1)
-            self.constrained_domain.map(src_coords[:,2,:], x2)
-
-            ravelled_indices = np.array([main_nearest[:, 1], main_nearest[:, 0], main_nearest[:, 2]]).T
-
-            v = x2 - x0
-            u = x - x0
-            t = np.sum(u * v, axis=1, keepdims=True) / np.sum(v * v, axis=1, keepdims=True)
-
-            w0 = 2*t*t - 3*t + 1
-            w1 = 4*t*(1 - t)
-            w2 = t*(2*t - 1)
-
-            row_indices = np.repeat(secondary, 3)
-            col_indices = ravelled_indices.ravel()
-            weights     = np.column_stack([w0, w1, w2]).ravel()
-
-            M = csr_matrix((weights, (row_indices, col_indices)), shape=(self.n_dofs, self.n_dofs))
-            return M
-
-        else:
-            raise RuntimeError("No Interpolation possible")
 
     def _create_mortar_interpolation_matrix(
             self,
@@ -1493,7 +1386,9 @@ class PeriodicBoundaryInterpolator:
         return coo_matrix((V.ravel(), (R.ravel(), C.ravel())), shape=(self.n_dofs, self.n_dofs)).tocsr()
 
     @staticmethod
-    def _fit_line_frame(pts: np.ndarray, tol: float = 1e-4):
+    def _fit_line_frame(
+            pts: np.ndarray
+        ) -> tuple[np.ndarray, np.ndarray, float]:
         """Dominante Tangente der Interface-Punktwolke via SVD."""
         origin = pts.mean(axis=0)
         Q = pts - origin
@@ -1508,19 +1403,15 @@ class PeriodicBoundaryInterpolator:
 
         if span <= 0.0:
             raise ValueError('degenerate interface: zero extent')
-        
-        off = float(np.linalg.norm(Q - np.outer(t, e), axis=1).max())
 
-        # if off > tol * span:
-        #     raise ValueError(
-        #     f'interface is not straight in the mapped frame (off-axis '
-        #     f'deviation {off:.3e} vs span {span:.3e}); a curved interface '
-        #     f'needs true arclength parametrisation')
-        
         return origin, e, span
     
     @staticmethod
-    def _collapse(t: np.ndarray, dofs: np.ndarray, tol: float):
+    def _collapse(
+            t: np.ndarray, 
+            dofs: np.ndarray, 
+            tol: float
+        ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, int]:
         """DOFs auf geometrische Knoten clustern.
         Komponentenslot = Rang des globalen DOF-Index innerhalb des Knotens.
         """
@@ -1553,7 +1444,10 @@ class PeriodicBoundaryInterpolator:
         return t_node, node_of, comp_of, dof_at, n_comp
     
     @staticmethod
-    def _line_elements(n_node: int, order: int) -> np.ndarray:
+    def _line_elements(
+            n_node: int, 
+            order: int
+        ) -> np.ndarray:
         """Elementkonnektivitaet eines zusammenhaengenden 1-D Knotenzugs."""
         if order == 1:
             i = np.arange(n_node - 1)
@@ -1568,7 +1462,11 @@ class PeriodicBoundaryInterpolator:
         return np.column_stack([v, v + 1, v + 2])
     
     @staticmethod
-    def _eval_basis(t_node: np.ndarray, elem: np.ndarray, x: np.ndarray):
+    def _eval_basis(
+            t_node: np.ndarray, 
+            elem: np.ndarray, 
+            x: np.ndarray
+        ) -> tuple[np.ndarray, np.ndarray]:
         """Element lokalisieren und Lagrange-Basis auswerten."""
         left = t_node[elem[:, 0]]
         e = np.clip(np.searchsorted(left, x, side='right') - 1,0, elem.shape[0] - 1)

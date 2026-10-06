@@ -117,15 +117,10 @@ def linear_solve(
     else:
         P_matrix = None  # pylint: disable=invalid-name
 
-    start = time.time()
     for pbc in pbcs:
         PBI = _utils.PeriodicBoundaryInterpolator(pbc)
         A_matrix = PBI.apply_periodic_bcs(A_matrix)
         b = PBI.apply_periodic_bcs(b)
-
-    end = time.time()
-
-    print("Elapsed time for PBCs: " + str(end-start) + "seconds")
 
     if linear_solver is None:
         linear_solver = _utils.linalg.LinearSolver()
