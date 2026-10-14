@@ -285,3 +285,213 @@ def test_shape_problem_periodic_boundaries_fixed():
 
     compare_boundary_values(y, sample_line(1, 0.0), lambda pt: (pt[0], 1.0),
                             atol=1e-3)
+
+def _nonmatching_periodic_mesh(resolution=20):
+    """Create a mesh with fewer DoFs on x=0 than on x=1."""
+    mesh, _, boundaries, dx, ds, dS = cashocs.regular_mesh(resolution)
+    tdim = mesh.topology().dim()
+
+    # Von cashocs gesetzte Metadaten sichern.
+    physical_groups = mesh.physical_groups
+
+    cell_markers = fenics.MeshFunction("bool", mesh, tdim, False)
+
+    for cell in fenics.cells(mesh):
+        if cell.midpoint().x() > 1.0 - 1.0 / resolution:
+            cell_markers[cell] = True
+
+    # refine erzeugt ein neues Mesh ohne Python-/cashocs-Metadaten.
+    mesh = fenics.refine(mesh, cell_markers)
+    mesh.physical_groups = physical_groups
+
+    mesh.bounding_box_tree().build(mesh)
+
+    # MeshFunctions nach dem Refinement neu erzeugen.
+    subdomains = fenics.MeshFunction("size_t", mesh, tdim, 0)
+    boundaries = fenics.MeshFunction("size_t", mesh, tdim - 1, 0)
+
+    fenics.CompiledSubDomain(
+        "on_boundary && near(x[0], 0.0)"
+    ).mark(boundaries, TAG_LEFT)
+
+    fenics.CompiledSubDomain(
+        "on_boundary && near(x[0], 1.0)"
+    ).mark(boundaries, TAG_RIGHT)
+
+    fenics.CompiledSubDomain(
+        "on_boundary && near(x[1], 0.0)"
+    ).mark(boundaries, TAG_BOTTOM)
+
+    fenics.CompiledSubDomain(
+        "on_boundary && near(x[1], 1.0)"
+    ).mark(boundaries, TAG_TOP)
+
+    dx = fenics.Measure("dx", domain=mesh, subdomain_data=subdomains)
+    ds = fenics.Measure("ds", domain=mesh, subdomain_data=boundaries)
+    dS = fenics.Measure("dS", domain=mesh)
+
+    return mesh, subdomains, boundaries, dx, ds, dS
+
+
+def _scalar_boundary_dof_count(V, boundaries, tag):
+    """Count scalar FE DoFs associated with one tagged boundary."""
+    bc = fenics.DirichletBC(
+        V,
+        fenics.Constant(0.0),
+        boundaries,
+        tag,
+    )
+    return len(bc.get_boundary_values())
+
+def test_poisson_scalar_periodic_nonmatching_discretization():
+    mesh, _, boundaries, dx, ds, dS = _nonmatching_periodic_mesh()
+
+    cd = ShiftPeriodic(
+        shift=(1.0, 0.0),
+        main_coord=0.0,
+        axis=0,
+    )
+
+    # Deliberately no constrained_domain=cd here.
+    V = fenics.FunctionSpace(mesh, "CG", 1)
+
+    main_dofs = _scalar_boundary_dof_count(V, boundaries, TAG_LEFT)
+    secondary_dofs = _scalar_boundary_dof_count(V, boundaries, TAG_RIGHT)
+
+    assert secondary_dofs > main_dofs, (
+        "The secondary boundary should have more DoFs than the main boundary."
+    )
+
+    u = fenics.TrialFunction(V)
+    v = fenics.TestFunction(V)
+
+    f = fenics.Expression(
+        "sin(2*pi*x[1]) + x[0]*x[0]",
+        degree=2,
+    )
+
+    a = fenics.inner(fenics.grad(u), fenics.grad(v)) * dx + u * v * dx
+    L = f * v * dx
+
+    bcs = [
+        fenics.DirichletBC(
+            V,
+            fenics.Constant(0.0),
+            boundaries,
+            TAG_BOTTOM,
+        ),
+        fenics.DirichletBC(
+            V,
+            fenics.Constant(0.0),
+            boundaries,
+            TAG_TOP,
+        ),
+    ]
+
+    bcs += cashocs.create_periodic_bcs(
+        V,
+        boundaries,
+        [TAG_LEFT, TAG_RIGHT],
+        cd,
+    )
+
+    u_sol = fenics.Function(V)
+    _utils.assemble_and_solve_linear(a, L, u_sol, bcs)
+
+    compare_boundary_values(
+        u_sol,
+        sample_line(0, 0.0, n=13),
+        lambda pt: (1.0, pt[1]),
+        atol=1e-2,
+    )
+
+def test_stokes_mixed_periodic_nonmatching_discretization():
+    mesh, _, boundaries, dx, ds, dS = _nonmatching_periodic_mesh()
+
+    cd = ShiftPeriodic(
+        shift=(1.0, 0.0),
+        main_coord=0.0,
+        axis=0,
+    )
+
+    # Verify unequal trace discretizations for both velocity and pressure
+    # element degrees used below.
+    Q1 = fenics.FunctionSpace(mesh, "CG", 1)
+    Q2 = fenics.FunctionSpace(mesh, "CG", 2)
+
+    assert (
+        _scalar_boundary_dof_count(Q1, boundaries, TAG_RIGHT)
+        > _scalar_boundary_dof_count(Q1, boundaries, TAG_LEFT)
+    )
+
+    assert (
+        _scalar_boundary_dof_count(Q2, boundaries, TAG_RIGHT)
+        > _scalar_boundary_dof_count(Q2, boundaries, TAG_LEFT)
+    )
+
+    TH = fenics.MixedElement([
+        fenics.VectorElement("CG", mesh.ufl_cell(), 2),
+        fenics.FiniteElement("CG", mesh.ufl_cell(), 1),
+    ])
+
+    # Deliberately no constrained_domain=cd here.
+    W = fenics.FunctionSpace(mesh, TH)
+
+    (u, p), (v, q) = fenics.TrialFunctions(W), fenics.TestFunctions(W)
+
+    a = (
+        fenics.inner(fenics.grad(u), fenics.grad(v)) * dx
+        - p * fenics.div(v) * dx
+        - q * fenics.div(u) * dx
+    )
+
+    # x-dependent forcing makes the periodic constraint nontrivial.
+    force = fenics.Expression(
+        ("x[0]", "-1.0"),
+        degree=1,
+    )
+    L = fenics.inner(force, v) * dx
+
+    bcs = [
+        fenics.DirichletBC(
+            W.sub(0),
+            fenics.Constant((0.0, 0.0)),
+            boundaries,
+            TAG_BOTTOM,
+        ),
+        fenics.DirichletBC(
+            W.sub(0),
+            fenics.Constant((1.0, 0.0)),
+            boundaries,
+            TAG_TOP,
+        ),
+    ]
+
+    bcs += cashocs.create_periodic_bcs(
+        W,
+        boundaries,
+        [TAG_LEFT, TAG_RIGHT],
+        cd,
+    )
+
+    w_sol = fenics.Function(W)
+    _utils.assemble_and_solve_linear(a, L, w_sol, bcs)
+
+    u_sol, p_sol = w_sol.split(deepcopy=True)
+
+    main_points = sample_line(0, 0.0, n=13)
+    secondary_map = lambda pt: (1.0, pt[1])
+
+    compare_boundary_values(
+        u_sol,
+        main_points,
+        secondary_map,
+        atol=1e-2,
+    )
+
+    compare_boundary_values(
+        p_sol,
+        main_points,
+        secondary_map,
+        atol=1e-2,
+    )
